@@ -1,0 +1,73 @@
+malta-road-recovery/
+│
+├── config/
+│   ├── roads.yaml              # geometry, lane counts, speed limits
+│   ├── simulation.yaml         # SUMO run parameters, time steps
+│   └── ml.yaml                 # hyperparameters, feature names
+│
+├── data/
+│   ├── raw/
+│   │   ├── video/              # original .mp4 clips (10am, 1pm, 5pm)
+│   │   └── osm/                # downloaded .osm files
+│   ├── processed/
+│   │   ├── yolo_output/        # per-clip CSVs from YOLO
+│   │   └── calibration/        # vType params derived from YOLO
+│   ├── synthetic/
+│   │   └── simulation_runs/    # one CSV per TraCI run
+│   └── features/
+│       ├── train.csv
+│       └── test.csv
+│
+├── vision/                     # Phase 1 — YOLO pipeline
+│   ├── detect.py               # YOLOv8 inference + ByteTrack
+│   ├── virtual_gates.py        # entry/exit line logic
+│   ├── extract_metrics.py      # flow rate, speed, composition
+│   └── utils.py
+│
+├── simulation/                 # Phase 2 + 3 — SUMO & TraCI
+│   ├── networks/
+│   │   ├── regional_road/      # .net.xml, .poly.xml
+│   │   └── valley_road/
+│   ├── demand/
+│   │   ├── regional_10am.rou.xml
+│   │   ├── regional_1pm.rou.xml
+│   │   ├── regional_5pm.rou.xml
+│   │   ├── valley_10am.rou.xml
+│   │   ├── valley_1pm.rou.xml
+│   │   └── valley_5pm.rou.xml
+│   ├── traci/
+│   │   ├── run_incident.py     # single-run TraCI script
+│   │   ├── batch_runner.py     # loops over experiment matrix
+│   │   ├── metrics_logger.py   # logs speed/flow every second
+│   │   └── congestion_flag.py  # back-pressure detector
+│   └── sumo_configs/
+│       ├── regional.sumocfg
+│       └── valley.sumocfg
+│
+├── ml/                         # Phase 4 — modelling
+│   ├── build_features.py       # raw sim CSVs → features/train.csv
+│   ├── train.py                # XGBoost + RF + linear baseline
+│   ├── evaluate.py             # RMSE, feature importance plots
+│   ├── predict.py              # inference on new inputs
+│   └── models/                 # saved .pkl / .json model files
+│       ├── xgboost_trec.pkl
+│       └── rf_trec.pkl
+│
+├── notebooks/
+│   ├── 01_yolo_exploration.ipynb
+│   ├── 02_sumo_calibration.ipynb
+│   ├── 03_synthetic_dataset_eda.ipynb
+│   └── 04_ml_results.ipynb
+│
+├── reports/
+│   ├── figures/                # exported plots for writeup
+│   └── validation_notes.md     # manual observations per road segment
+│
+├── tests/
+│   ├── test_gates.py
+│   ├── test_traci_loop.py
+│   └── test_features.py
+│
+├── requirements.txt
+├── README.md
+└── .gitignore

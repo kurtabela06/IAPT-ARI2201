@@ -1,0 +1,7 @@
+# Malta Road Recovery Predictor — Phase 1 dependencies
+# Install with: pip install -r requirements.txt
+
+ultralytics>=8.2.0        # YOLOv8/v10 + ByteTrack
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+pandas>=2.2.0
