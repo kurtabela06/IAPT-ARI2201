@@ -1,0 +1,14 @@
+# Place your 15-minute video clips here.
+#
+# Required naming convention:
+#   <segment>_<slot>.mp4
+#
+# Examples:
+#   regional_10am.mp4   (Regional Road, 10 am peak)
+#   regional_1pm.mp4    (Regional Road, 1 pm off-peak)
+#   regional_5pm.mp4    (Regional Road, 5 pm evening peak)
+#   valley_10am.mp4     (Valley Road, 10 am)
+#   valley_1pm.mp4
+#   valley_5pm.mp4
+#
+# Supported extensions: .mp4  .avi  .mov

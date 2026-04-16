@@ -1,7 +1,37 @@
-# Malta Road Recovery Predictor — Phase 1 dependencies
-# Install with: pip install -r requirements.txt
+# Malta Road Recovery Predictor — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Tested on Python 3.10+ (3.11 recommended)
 
-ultralytics>=8.2.0        # YOLOv8/v10 + ByteTrack
-opencv-python-headless>=4.9.0
+# ---------------------------------------------------------------------------
+# Phase 1 — Vision pipeline
+# ---------------------------------------------------------------------------
+ultralytics>=8.2.0          # YOLOv8 + built-in ByteTrack tracker
+opencv-python-headless>=4.9.0  # headless for servers; swap to opencv-python
+                               # if you need GUI preview windows on a desktop
 numpy>=1.26.0
 pandas>=2.2.0
+scipy>=1.12.0               # used by ByteTrack internals
+
+# ByteTrack requires a fast LAP solver — try lapx first (pure Python wheel),
+# fall back to lap if it fails on your platform.
+lapx>=0.5.5                 # pip install lapx
+# lap>=0.4.0                # uncomment instead if lapx fails
+
+# ---------------------------------------------------------------------------
+# Phase 2 — SUMO / TraCI  (install separately when needed)
+# ---------------------------------------------------------------------------
+# sumolib>=1.19.0
+# traci>=1.19.0
+
+# ---------------------------------------------------------------------------
+# Phase 3 — ML
+# ---------------------------------------------------------------------------
+# scikit-learn>=1.4.0
+# xgboost>=2.0.0
+
+# ---------------------------------------------------------------------------
+# General
+# ---------------------------------------------------------------------------
+PyYAML>=6.0.1               # config file parsing
+tqdm>=4.66.0                # progress bars in batch scripts

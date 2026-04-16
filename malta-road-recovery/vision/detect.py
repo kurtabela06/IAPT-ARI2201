@@ -1,23 +1,44 @@
 """
-Malta Road Recovery Predictor — Phase 1: YOLO Detection & Tracking
-===================================================================
-Segment-aware vehicle detection, tracking, and speed estimation.
-Outputs: data/processed/yolo_output/<segment>_<slot>.csv
+vision/detect.py
+================
+Phase 1 detection & tracking pipeline for a single video clip.
 
-Requirements:
-    pip install ultralytics opencv-python-headless pandas numpy
+Produces TWO output files per clip:
 
-Usage:
-    python vision/detect.py --video data/raw/video/regional_10am.mp4 \
-                             --segment regional \
-                             --slot 10am
+1. Per-frame CSV  (data/processed/yolo_output/<segment>_<slot>_frames.csv)
+   Columns: frame, id, class, speed_kph, entry_time
+   One row per detected vehicle per frame — the raw ground truth.
+
+2. Per-minute summary CSV  (data/processed/yolo_output/<segment>_<slot>.csv)
+   Aggregated 1-minute bins used downstream by extract_metrics.py
+   and SUMO calibration.
+
+Key calibration parameters live in vision/config.py — do NOT edit constants
+here; change them there instead.
+
+Usage (single clip)
+-------------------
+    cd malta-road-recovery
+    python vision/detect.py \
+        --video   data/raw/video/regional_10am.mp4 \
+        --segment regional \
+        --slot    10am
+
+Options
+-------
+    --model    yolov8n.pt | yolov8s.pt | yolov8m.pt  (default: from config)
+    --gate     0.55   Y position as fraction of frame height (overrides config)
+    --preview         open a live OpenCV window (for gate/ROI verification)
+    --no-roi          disable ROI masking (useful for debugging)
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import sys
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,92 +46,35 @@ import pandas as pd
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
-# PROJECT ROOT  (vision/detect.py → project root is one level up)
+# PATH SETUP
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VIDEO_DIR    = PROJECT_ROOT / "data" / "raw" / "video"
-OUTPUT_DIR   = PROJECT_ROOT / "data" / "processed" / "yolo_output"
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from vision.config import (          # noqa: E402
+    CALIBRATION,
+    VEHICLE_CLASSES,
+    DEFAULT_MODEL,
+    TRACKER_CFG,
+    SPEED_SMOOTH_FRAMES,
+    CONFIDENCE_THRESHOLD,
+    BIN_SECONDS,
+    ROI_POLYGONS,
+    GATE_Y_RATIOS,
+    PER_FRAME_COLUMNS,
+)
+from vision.utils import (           # noqa: E402
+    build_roi_mask,
+    apply_roi_mask,
+    centroid_in_roi,
+    draw_roi,
+)
+from vision.virtual_gates import VirtualGate, GateCrossing, make_gate  # noqa: E402
+
+OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "yolo_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# PIXEL-TO-METRE CALIBRATION CONSTANTS
-# ---------------------------------------------------------------------------
-# Replace these with values measured from your actual camera setup.
-# Method: place a known-length reference object (e.g. a 4 m road marking)
-# in the video frame and count the pixels it spans.
-#
-#   PIXELS_PER_METRE = pixel_length_of_reference / real_length_in_metres
-#
-# These are *placeholder* values — one per road type to account for
-# different camera heights / angles.
-
-CALIBRATION = {
-    "regional": {
-        "pixels_per_metre": 8.5,   # PLACEHOLDER — calibrate from footage
-        "lanes": 2,
-        "approx_road_width_m": 7.0,
-    },
-    "valley": {
-        "pixels_per_metre": 10.2,  # PLACEHOLDER — calibrate from footage
-        "lanes": 1,
-        "approx_road_width_m": 3.5,
-    },
-}
-
-# YOLO class IDs we care about (COCO dataset)
-VEHICLE_CLASSES = {
-    2:  "car",
-    3:  "motorcycle",
-    5:  "bus",
-    7:  "truck",
-}
-
-# Aggregation window in seconds
-BIN_SECONDS = 60
-
-
-# ---------------------------------------------------------------------------
-# VIRTUAL GATE
-# ---------------------------------------------------------------------------
-
-class VirtualGate:
-    """
-    A horizontal line across the frame. A vehicle is counted when its
-    tracked centroid crosses from one side of the line to the other.
-
-    Args:
-        y_position  : pixel row of the gate line
-        frame_width : width of the video frame in pixels
-        label       : human-readable name (e.g. "entry" or "exit")
-    """
-
-    def __init__(self, y_position: int, frame_width: int, label: str = "gate"):
-        self.y = y_position
-        self.width = frame_width
-        self.label = label
-        self._prev_y: dict[int, float] = {}   # track_id → last centroid y
-
-    def update(self, track_id: int, cx: float, cy: float) -> bool:
-        """
-        Returns True if the vehicle with `track_id` just crossed this gate.
-        """
-        crossed = False
-        if track_id in self._prev_y:
-            prev = self._prev_y[track_id]
-            # Upward crossing (entering frame from bottom)
-            if prev > self.y >= cy:
-                crossed = True
-            # Downward crossing (entering frame from top)
-            elif prev < self.y <= cy:
-                crossed = True
-        self._prev_y[track_id] = cy
-        return crossed
-
-    def draw(self, frame: np.ndarray) -> np.ndarray:
-        cv2.line(frame, (0, self.y), (self.width, self.y), (0, 255, 0), 2)
-        cv2.putText(frame, self.label, (10, self.y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-        return frame
+VIDEO_DIR = PROJECT_ROOT / "data" / "raw" / "video"
 
 
 # ---------------------------------------------------------------------------
@@ -119,82 +83,97 @@ class VirtualGate:
 
 class SpeedEstimator:
     """
-    Estimates instantaneous speed in km/h for a tracked vehicle.
+    Converts frame-to-frame pixel displacement into km/h.
 
-    Uses two consecutive centroid positions and the frame interval to
-    derive pixel displacement, then converts to metres via calibration.
-
-    Args:
-        pixels_per_metre : calibration constant for this road segment
-        fps              : video frames per second
+    Parameters
+    ----------
+    pixels_per_metre : calibration constant — pixels that correspond to 1 metre
+    fps              : video frame rate
     """
 
-    def __init__(self, pixels_per_metre: float, fps: float):
+    def __init__(self, pixels_per_metre: float, fps: float) -> None:
         self.ppm = pixels_per_metre
         self.fps = fps
-        self._prev: dict[int, tuple[float, float]] = {}   # id → (cx, cy)
+        self._prev: dict[int, tuple[float, float]] = {}
+        self._buffer: dict[int, list[float]] = defaultdict(list)
 
     def update(self, track_id: int, cx: float, cy: float) -> float | None:
         """
-        Returns speed in km/h, or None if this is the first observation.
+        Returns the smoothed speed in km/h, or None on the first observation.
+
+        The raw speed is appended to a rolling buffer of SPEED_SMOOTH_FRAMES
+        values; the return value is the mean of that buffer.
         """
-        speed_kmh = None
+        raw = None
         if track_id in self._prev:
             px, py = self._prev[track_id]
-            pixel_dist = np.hypot(cx - px, cy - py)
+            pixel_dist = float(np.hypot(cx - px, cy - py))
             metres     = pixel_dist / self.ppm
-            seconds    = 1.0 / self.fps
-            speed_kmh  = (metres / seconds) * 3.6   # m/s → km/h
+            speed_ms   = metres * self.fps          # metres per second
+            raw        = speed_ms * 3.6             # → km/h
+
+            # Sanity clamp: discard physically impossible spikes
+            # (> 180 km/h is almost certainly a tracker glitch)
+            if raw > 180:
+                raw = None
+
         self._prev[track_id] = (cx, cy)
-        return speed_kmh
+
+        if raw is not None:
+            buf = self._buffer[track_id]
+            buf.append(raw)
+            if len(buf) > SPEED_SMOOTH_FRAMES:
+                buf.pop(0)
+
+        buf = self._buffer.get(track_id, [])
+        return float(np.mean(buf)) if buf else None
+
+    def forget(self, track_id: int) -> None:
+        self._prev.pop(track_id, None)
+        self._buffer.pop(track_id, None)
 
 
 # ---------------------------------------------------------------------------
-# BIN AGGREGATOR
+# BIN AGGREGATOR  (1-minute summary rows)
 # ---------------------------------------------------------------------------
 
 class BinAggregator:
-    """
-    Accumulates per-frame detections and flushes them into 1-minute CSV rows.
-    """
+    """Accumulates gate crossings and flushes them into 1-minute summary rows."""
 
-    def __init__(self, bin_seconds: int = BIN_SECONDS):
-        self.bin_seconds = bin_seconds
-        self._current_bin: int = -1
+    def __init__(self, bin_seconds: int = BIN_SECONDS) -> None:
+        self.bin_seconds   = bin_seconds
+        self._current_bin  = -1
         self._counts: dict[str, int] = defaultdict(int)
-        self._speeds: list[float] = []
-        self.rows: list[dict] = []
+        self._speeds: list[float]    = []
+        self.rows: list[dict]        = []
 
-    def _bin_index(self, timestamp_s: float) -> int:
-        return int(timestamp_s // self.bin_seconds)
+    def _bin_index(self, ts: float) -> int:
+        return int(ts // self.bin_seconds)
 
-    def add(self, timestamp_s: float, class_name: str, speed_kmh: float | None):
-        bin_idx = self._bin_index(timestamp_s)
-
-        if bin_idx != self._current_bin and self._current_bin >= 0:
+    def add(self, ts: float, class_name: str, speed_kph: float | None) -> None:
+        idx = self._bin_index(ts)
+        if idx != self._current_bin and self._current_bin >= 0:
             self._flush(self._current_bin)
-
-        self._current_bin = bin_idx
+        self._current_bin = idx
         self._counts[class_name] += 1
-        if speed_kmh is not None and speed_kmh > 0:
-            self._speeds.append(speed_kmh)
+        if speed_kph is not None and speed_kph > 0:
+            self._speeds.append(speed_kph)
 
-    def _flush(self, bin_idx: int):
-        ts = bin_idx * self.bin_seconds
+    def _flush(self, bin_idx: int) -> None:
+        ts    = bin_idx * self.bin_seconds
         total = sum(self._counts.values())
-        avg_spd = float(np.mean(self._speeds)) if self._speeds else 0.0
-
+        avg   = float(np.mean(self._speeds)) if self._speeds else 0.0
         self.rows.append({
-            "timestamp_s":    ts,
-            "timestamp_min":  round(ts / 60, 2),
-            "vehicle_count":  total,
-            "avg_speed_kmh":  round(avg_spd, 2),
+            "timestamp_s":   ts,
+            "timestamp_min": round(ts / 60, 2),
+            "vehicle_count": total,
+            "avg_speed_kmh": round(avg, 2),
             **{f"count_{k}": self._counts.get(k, 0) for k in VEHICLE_CLASSES.values()},
         })
         self._counts = defaultdict(int)
         self._speeds = []
 
-    def finalise(self, last_timestamp_s: float):
+    def finalise(self, last_ts: float) -> None:
         if self._current_bin >= 0:
             self._flush(self._current_bin)
 
@@ -203,86 +182,112 @@ class BinAggregator:
 # MAIN PIPELINE
 # ---------------------------------------------------------------------------
 
-def validate_video_path(video_path: Path) -> None:
-    """
-    Raises SystemExit with a descriptive CRITICAL error if the video is missing.
-    """
-    if not video_path.exists():
-        candidates = list(VIDEO_DIR.glob("*.mp4")) + list(VIDEO_DIR.glob("*.avi"))
-        if not candidates:
-            sys.exit(
-                "CRITICAL: Video samples not found in data/raw/video. "
-                "Please provide 15-minute clips to proceed with ground-truth calibration."
-            )
-        else:
-            sys.exit(
-                f"CRITICAL: Requested file '{video_path.name}' not found in "
-                f"data/raw/video. Available files: "
-                + ", ".join(p.name for p in candidates)
-            )
-
-
 def run_pipeline(
-    video_path: Path,
-    segment: str,
-    slot: str,
-    model_name: str = "yolov8n.pt",
-    gate_ratio: float = 0.55,
-    show_preview: bool = False,
-) -> Path:
+    video_path:   Path,
+    segment:      str,
+    slot:         str,
+    model_name:   str   = DEFAULT_MODEL,
+    gate_ratio:   float | None = None,
+    show_preview: bool  = False,
+    use_roi:      bool  = True,
+) -> tuple[Path, Path]:
     """
-    Full Phase 1 pipeline for one video clip.
+    Run the full Phase 1 pipeline for one video clip.
 
-    Args:
-        video_path  : path to the .mp4 file
-        segment     : "regional" or "valley"
-        slot        : time-slot label, e.g. "10am", "1pm", "5pm"
-        model_name  : YOLO weights to use
-        gate_ratio  : vertical position of gate as fraction of frame height
-        show_preview: open a live preview window (useful for gate calibration)
+    Parameters
+    ----------
+    video_path   : absolute path to the .mp4 / .avi file
+    segment      : "regional" | "valley"
+    slot         : time-slot label — "10am", "1pm", "5pm"
+    model_name   : YOLO weights file name (will be auto-downloaded if absent)
+    gate_ratio   : override the gate Y-fraction from config (None = use config)
+    show_preview : open an OpenCV display window for visual verification
+    use_roi      : apply the ROI polygon mask (disable for debugging)
 
-    Returns:
-        Path to the output CSV.
+    Returns
+    -------
+    (per_frame_csv_path, summary_csv_path)
     """
-    validate_video_path(video_path)
+    # --- Validate inputs ---------------------------------------------------
+    if not video_path.exists():
+        sys.exit(
+            f"CRITICAL: No video samples found in data/raw/video. "
+            f"Please add 15-minute clips (e.g., regional_10am.mp4) to begin."
+        )
 
     if segment not in CALIBRATION:
-        sys.exit(f"ERROR: Unknown segment '{segment}'. Choose: {list(CALIBRATION)}")
+        sys.exit(
+            f"ERROR: Unknown segment '{segment}'. "
+            f"Expected one of: {list(CALIBRATION.keys())}"
+        )
 
-    calib    = CALIBRATION[segment]
-    ppm      = calib["pixels_per_metre"]
-    n_lanes  = calib["lanes"]
+    calib   = CALIBRATION[segment]
+    ppm     = calib["pixels_per_metre"]
+    n_lanes = calib["lanes"]
 
-    print(f"\n[Malta YOLO] Segment : {segment.upper()} ({n_lanes}-lane)")
-    print(f"[Malta YOLO] Slot    : {slot}")
-    print(f"[Malta YOLO] Video   : {video_path.name}")
-    print(f"[Malta YOLO] Cal PPM : {ppm} px/m  (placeholder — update after filming)\n")
+    print(f"\n{'='*60}")
+    print(f"[detect] Segment : {segment.upper()}  ({n_lanes}-lane)")
+    print(f"[detect] Slot    : {slot}")
+    print(f"[detect] Video   : {video_path.name}")
+    print(f"[detect] PPM     : {ppm} px/m  "
+          f"(PLACEHOLDER — update vision/config.py after calibration)")
+    print(f"{'='*60}\n")
 
-    # --- Video capture ---
+    # --- Open video --------------------------------------------------------
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        sys.exit(f"CRITICAL: Cannot open video file: {video_path}")
+        sys.exit(f"CRITICAL: Cannot open video: {video_path}")
 
     fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
     frame_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"[Malta YOLO] Resolution : {frame_w}×{frame_h}  |  FPS : {fps:.1f}  |  Frames : {total_frames}")
+    print(f"[detect] Resolution : {frame_w}×{frame_h}  |  FPS : {fps:.1f}  "
+          f"|  Total frames : {total_frames}")
 
-    # --- Components ---
+    # --- Build ROI ---------------------------------------------------------
+    roi_polygon = None
+    roi_mask    = None
+
+    if use_roi and ROI_POLYGONS is not None and segment in ROI_POLYGONS:
+        roi_polygon = ROI_POLYGONS[segment]
+        roi_mask    = build_roi_mask((frame_h, frame_w), roi_polygon)
+        print(f"[detect] ROI     : {len(roi_polygon)}-point polygon  "
+              f"(PLACEHOLDER — update config.py after measuring)")
+    else:
+        print("[detect] ROI     : DISABLED")
+
+    # --- Build gate --------------------------------------------------------
+    if gate_ratio is not None:
+        # CLI override — bypass config
+        gate_y = int(frame_h * gate_ratio)
+        gate   = VirtualGate(
+            y_position  = gate_y,
+            frame_width = frame_w,
+            label       = f"{segment} gate",
+            roi_polygon = roi_polygon,
+        )
+    else:
+        gate = make_gate(segment, frame_h, frame_w, "primary")
+        gate_y = gate.y
+
+    print(f"[detect] Gate Y  : {gate_y}px  ({gate_y/frame_h:.0%} of frame height)\n")
+
+    # --- Initialise components ---------------------------------------------
     model      = YOLO(model_name)
-    gate_y     = int(frame_h * gate_ratio)
-    gate       = VirtualGate(gate_y, frame_w, label=f"{segment} gate")
     estimator  = SpeedEstimator(ppm, fps)
     aggregator = BinAggregator()
 
-    # Per-track speed buffer (rolling mean over last N frames)
-    track_speeds: dict[int, list[float]] = defaultdict(list)
-    SPEED_BUFFER = 10
+    # Per-frame rows: frame, id, class, speed_kph, entry_time
+    per_frame_rows: list[dict] = []
+
+    # Track which IDs have already been recorded as "entry" events
+    entry_logged: set[int] = set()
 
     frame_idx = 0
 
+    # --- Frame loop --------------------------------------------------------
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -290,13 +295,17 @@ def run_pipeline(
 
         timestamp_s = frame_idx / fps
 
-        # --- YOLO inference with ByteTrack ---
+        # Apply ROI mask to frame before YOLO inference
+        inference_frame = apply_roi_mask(frame, roi_mask) if roi_mask is not None else frame
+
+        # YOLO + ByteTrack
         results = model.track(
-            frame,
-            persist=True,
-            classes=list(VEHICLE_CLASSES.keys()),
-            tracker="bytetrack.yaml",
-            verbose=False,
+            inference_frame,
+            persist          = True,
+            classes          = list(VEHICLE_CLASSES.keys()),
+            tracker          = TRACKER_CFG,
+            conf             = CONFIDENCE_THRESHOLD,
+            verbose          = False,
         )
 
         if results and results[0].boxes is not None:
@@ -311,42 +320,73 @@ def run_pipeline(
                 class_name = VEHICLE_CLASSES.get(cls_id, "unknown")
 
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+
+                # Secondary ROI check on the raw centroid
+                if roi_polygon and not centroid_in_roi(x1, y1, x2, y2, roi_polygon):
+                    continue
 
                 # Speed estimation
-                raw_speed = estimator.update(track_id, cx, cy)
-                if raw_speed is not None:
-                    track_speeds[track_id].append(raw_speed)
-                    if len(track_speeds[track_id]) > SPEED_BUFFER:
-                        track_speeds[track_id].pop(0)
+                speed = estimator.update(track_id, cx, cy)
 
-                smoothed_speed = (
-                    float(np.mean(track_speeds[track_id]))
-                    if track_speeds[track_id] else None
+                # --- Per-frame CSV row ------------------------------------
+                per_frame_rows.append({
+                    "frame":      frame_idx,
+                    "id":         track_id,
+                    "class":      class_name,
+                    "speed_kph":  round(speed, 2) if speed is not None else "",
+                    "entry_time": round(timestamp_s, 3),
+                })
+
+                # --- Gate crossing check ----------------------------------
+                crossing: GateCrossing | None = gate.update(
+                    track_id    = track_id,
+                    cx          = cx,
+                    cy          = cy,
+                    timestamp_s = timestamp_s,
+                    class_name  = class_name,
+                    speed_kph   = speed,
+                    frame_idx   = frame_idx,
                 )
 
-                # Gate crossing → count + log
-                if gate.update(track_id, cx, cy):
-                    aggregator.add(timestamp_s, class_name, smoothed_speed)
+                if crossing is not None:
+                    aggregator.add(timestamp_s, class_name, speed)
+                    if track_id not in entry_logged:
+                        entry_logged.add(track_id)
+                        print(
+                            f"  [gate] t={timestamp_s:>7.1f}s  "
+                            f"ID={track_id:<4}  {class_name:<12}  "
+                            f"{'N/A' if speed is None else f'{speed:>5.1f} km/h'}  "
+                            f"dir={crossing.direction}"
+                        )
 
-                # Annotate frame
+                # --- Preview annotation -----------------------------------
                 if show_preview:
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)),
-                                  (255, 165, 0), 1)
-                    label = f"{class_name} #{track_id}"
-                    if smoothed_speed:
-                        label += f" {smoothed_speed:.0f}km/h"
-                    cv2.putText(frame, label, (int(x1), int(y1) - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1)
+                    cv2.rectangle(
+                        frame,
+                        (int(x1), int(y1)), (int(x2), int(y2)),
+                        (255, 165, 0), 1,
+                    )
+                    lbl = f"{class_name} #{track_id}"
+                    if speed:
+                        lbl += f" {speed:.0f}km/h"
+                    cv2.putText(
+                        frame, lbl, (int(x1), max(int(y1) - 6, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1,
+                    )
 
+        # Overlay gate and ROI on preview
         if show_preview:
             gate.draw(frame)
-            cv2.putText(frame, f"t={timestamp_s:.1f}s  seg={segment}  slot={slot}",
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-            cv2.imshow("Malta YOLO Preview", frame)
+            cv2.putText(
+                frame,
+                f"t={timestamp_s:.1f}s  seg={segment}  slot={slot}",
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
+            )
+            cv2.imshow("Malta Road Recovery — Phase 1 Preview", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[Malta YOLO] Preview closed by user.")
+                print("[detect] Preview closed by user.")
                 break
 
         frame_idx += 1
@@ -360,61 +400,63 @@ def run_pipeline(
 
     aggregator.finalise(frame_idx / fps)
 
-    # --- Export CSV ---
-    output_path = OUTPUT_DIR / f"{segment}_{slot}.csv"
-    df = pd.DataFrame(aggregator.rows)
+    # --- Write per-frame CSV -----------------------------------------------
+    frames_path = OUTPUT_DIR / f"{segment}_{slot}_frames.csv"
+    df_frames   = pd.DataFrame(per_frame_rows, columns=PER_FRAME_COLUMNS)
+    df_frames.to_csv(frames_path, index=False)
+    print(f"\n[detect] Per-frame CSV : {frames_path}")
+    print(f"         {len(df_frames)} rows  |  "
+          f"{df_frames['id'].nunique()} unique track IDs")
 
-    # Add metadata columns useful for SUMO calibration
-    df.insert(0, "segment",  segment)
-    df.insert(1, "slot",     slot)
-    df.insert(2, "n_lanes",  n_lanes)
+    # --- Write summary CSV -------------------------------------------------
+    summary_path = OUTPUT_DIR / f"{segment}_{slot}.csv"
+    df_summary   = pd.DataFrame(aggregator.rows)
 
-    df.to_csv(output_path, index=False)
-    print(f"\n[Malta YOLO] Done. {len(df)} 1-minute bins written to:\n  {output_path}\n")
+    if not df_summary.empty:
+        df_summary.insert(0, "segment",  segment)
+        df_summary.insert(1, "slot",     slot)
+        df_summary.insert(2, "n_lanes",  n_lanes)
 
-    # Quick summary
-    if not df.empty:
-        print(f"  Peak flow    : {df['vehicle_count'].max()} veh/min")
-        print(f"  Mean speed   : {df['avg_speed_kmh'].mean():.1f} km/h")
-        print(f"  Total vehicles counted: {df['vehicle_count'].sum()}")
+    df_summary.to_csv(summary_path, index=False)
+    print(f"[detect] Summary CSV   : {summary_path}")
+    print(f"         {len(df_summary)} 1-minute bins\n")
 
-    return output_path
+    if not df_summary.empty:
+        print(f"  Peak gate flow : {df_summary['vehicle_count'].max()} veh/min")
+        print(f"  Mean speed     : {df_summary['avg_speed_kmh'].mean():.1f} km/h")
+        print(f"  Total counted  : {df_summary['vehicle_count'].sum()} vehicles")
+
+    return frames_path, summary_path
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI — single-clip entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Malta Road Recovery — Phase 1 YOLO pipeline"
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Malta Road Recovery — Phase 1: detect & track one video clip"
     )
-    parser.add_argument(
-        "--video",    required=True,  type=Path,
-        help="Path to input video, e.g. data/raw/video/regional_10am.mp4"
-    )
-    parser.add_argument(
-        "--segment",  required=True,  choices=["regional", "valley"],
-        help="Road segment type"
-    )
-    parser.add_argument(
-        "--slot",     required=True,
-        help="Time slot label: 10am | 1pm | 5pm"
-    )
-    parser.add_argument(
-        "--model",    default="yolov8n.pt",
-        help="YOLO weights file (default: yolov8n.pt)"
-    )
-    parser.add_argument(
-        "--gate",     default=0.55, type=float,
-        help="Gate Y position as fraction of frame height (default: 0.55)"
-    )
-    parser.add_argument(
-        "--preview",  action="store_true",
-        help="Show live OpenCV preview window"
-    )
+    p.add_argument("--video",    required=True, type=Path,
+                   help="e.g. data/raw/video/regional_10am.mp4")
+    p.add_argument("--segment",  required=True,
+                   choices=list(CALIBRATION.keys()),
+                   help="Road segment: regional | valley")
+    p.add_argument("--slot",     required=True,
+                   help="Time-slot label: 10am | 1pm | 5pm")
+    p.add_argument("--model",    default=DEFAULT_MODEL,
+                   help=f"YOLO weights (default: {DEFAULT_MODEL})")
+    p.add_argument("--gate",     default=None, type=float,
+                   help="Gate Y as fraction of frame height — overrides config")
+    p.add_argument("--preview",  action="store_true",
+                   help="Show live preview window (for gate/ROI verification)")
+    p.add_argument("--no-roi",   action="store_true",
+                   help="Disable ROI masking (debug mode)")
+    return p
 
-    args = parser.parse_args()
+
+def main() -> None:
+    args = _build_parser().parse_args()
     run_pipeline(
         video_path   = args.video,
         segment      = args.segment,
@@ -422,6 +464,7 @@ def main():
         model_name   = args.model,
         gate_ratio   = args.gate,
         show_preview = args.preview,
+        use_roi      = not args.no_roi,
     )
 
 
