@@ -3,42 +3,52 @@ vision/config.py
 ================
 Single source-of-truth for every calibration constant in Phase 1.
 
+VIDEO FORMAT
+------------
+Videos are recorded at 1080p, 30fps, PORTRAIT orientation.
+  Frame size: 1080 wide x 1920 tall  (width x height)
+  All (x, y) coordinates in this file use that convention.
+
 HOW TO CALIBRATE BEFORE YOUR FIRST RUN
 ---------------------------------------
-Step 1 — Capture a still frame from each clip:
-    python -c "
-    import cv2, sys
-    cap = cv2.VideoCapture(sys.argv[1])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 300)   # frame 300 ≈ 10 s in
-    _, f = cap.read()
-    cv2.imwrite('calibration_still.jpg', f)
-    cap.release()
-    " data/raw/video/regional_10am.mp4
+Step 1 — Use --test mode to grab a preview of the first frame:
+    cd malta-road-recovery
+    python vision/detect.py --video data/raw/video/regional_10am.mp4 \
+        --segment regional --slot 10am --test
 
-Step 2 — Open calibration_still.jpg in any image viewer that reports pixel
-    coordinates (e.g. GIMP, Preview, Paint).  Find a road feature whose
-    real-world length you know (lane width ≈ 3.5 m, road marking ≈ 3 m, etc.)
-    and note the pixel distance between its two ends.
+    The window that pops up shows frame 0 with the current ROI polygon
+    and gate line drawn on it.  Use this to check your coordinates before
+    committing to a full 10-minute run.
+
+Step 2 — Measure PIXELS_PER_METRE from that still frame.
+    Open the still in any image viewer that reports pixel coordinates
+    (e.g. GIMP, macOS Preview, Paint).  Find a road feature whose real-world
+    length you know (lane width ≈ 3.5 m, road marking ≈ 3 m, etc.) and note
+    the pixel distance between its two ends.
 
     PIXELS_PER_METRE = <pixel_distance> / <real_distance_in_metres>
 
     Update the value for the relevant segment below.
 
 Step 3 — ROI Polygon (Region of Interest)
-    In the same still image, click the four (or more) corners that enclose
-    the road you want to analyse.  Note each (x, y) pixel coordinate.
-    Replace the placeholder tuples in ROI_POLYGONS below.
+    In the same still, click the corners that enclose the road you want to
+    analyse.  Note each (x, y) pixel coordinate and replace the placeholder
+    tuples in ROI_POLYGONS below.
 
-    The polygon must be in ORDER (clockwise or anti-clockwise) and
-    must fully enclose the road lanes you care about.
+    The polygon must be in ORDER (clockwise or anti-clockwise) and must
+    fully enclose the road lanes you care about.
+
+    Remember: portrait frame = 1080 wide x 1920 tall.
+    x runs left→right (0-1080), y runs top→bottom (0-1920).
 
 Step 4 — Virtual Gate
-    Pick a horizontal Y pixel position that lies across the lane(s) inside
-    your ROI.  Vehicles are counted each time their tracked centroid crosses
-    this line.  Update GATE_Y_RATIOS below (value is 0.0-1.0 fraction of the
-    frame height, so it scales automatically to any resolution).
+    Pick a Y pixel position that lies across the lane(s) inside your ROI.
+    Vehicles are counted each time their centroid crosses this line.
+    Update GATE_Y_RATIOS below (value is 0.0-1.0 fraction of frame height,
+    so it scales to any resolution automatically).
 
-Step 5 — Re-run main.py with --preview to visually confirm.
+Step 5 — Re-run with --test to visually confirm your edits, then run the
+    full batch: python main.py
 """
 
 # ---------------------------------------------------------------------------
@@ -53,18 +63,18 @@ CALIBRATION: dict[str, dict] = {
     "regional": {
         # Regional Road — Twin-Carriageway / Tunnel Entrance section
         # Approx. 2 lanes, lane width ~3.5 m each.
-        # PLACEHOLDER: measure from footage and update.
-        "pixels_per_metre": 8.5,   # <-- REPLACE after Step 2
+        # PLACEHOLDER: measure from your footage and update (see Step 2 above).
+        "pixels_per_metre": 8.5,   # <-- REPLACE after measuring
         "lanes": 2,
-        "approx_road_width_m": 7.0,
+        "approx_road_width_m": 7,  # includes some shoulder area, not just lane width
     },
     "valley": {
         # Valley Road — Single-Lane section
         # Approx. 1 lane, road width ~3.5 m.
-        # PLACEHOLDER: measure from footage and update.
-        "pixels_per_metre": 10.2,  # <-- REPLACE after Step 2
+        # PLACEHOLDER: measure from your footage and update (see Step 2 above).
+        "pixels_per_metre": 10.2,  # <-- REPLACE after measuring
         "lanes": 1,
-        "approx_road_width_m": 3.5,
+        "approx_road_width_m": 3.0,  # single lane with no shoulder
     },
 }
 
@@ -94,23 +104,26 @@ ROI_POLYGONS: dict[str, list[tuple[int, int]]] | None = {
     "regional": [
         # ┌─────────────────────────────────────────────────────────────────┐
         # │  Regional Road — Double Lane — Tunnel Entrance                  │
-        # │  PLACEHOLDER  (1920×1080 frame assumed)                         │
-        # │  Replace with your actual (x, y) corner clicks from the still.  │
+        # │  PLACEHOLDER  (1080 × 1920 portrait frame)                      │
+        # │  x: 0 = left edge, 1080 = right edge                           │
+        # │  y: 0 = top  edge, 1920 = bottom edge                          │
+        # │  Run --test to see these overlaid on the first frame, then      │
+        # │  replace with your actual corner clicks.                        │
         # └─────────────────────────────────────────────────────────────────┘
-        (430, 350),   # top-left  corner of road area
-        (1490, 350),  # top-right corner
-        (1750, 980),  # bottom-right corner
-        (170, 980),   # bottom-left corner
+        (100, 500),   # top-left  corner of road area
+        (980, 500),   # top-right corner
+        (980, 1700),  # bottom-right corner
+        (100, 1700),  # bottom-left corner
     ],
     "valley": [
         # ┌─────────────────────────────────────────────────────────────────┐
         # │  Valley Road — Single Lane                                      │
-        # │  PLACEHOLDER  (1920×1080 frame assumed)                         │
+        # │  PLACEHOLDER  (1080 × 1920 portrait frame)                      │
         # └─────────────────────────────────────────────────────────────────┘
-        (700, 380),   # top-left
-        (1220, 380),  # top-right
-        (1400, 980),  # bottom-right
-        (520, 980),   # bottom-left
+        (250, 500),   # top-left
+        (830, 500),   # top-right
+        (830, 1700),  # bottom-right
+        (250, 1700),  # bottom-left
     ],
 }
 
@@ -153,6 +166,38 @@ DEFAULT_MODEL = "yolov8n.pt"
 
 # Tracker config bundled with ultralytics
 TRACKER_CFG = "bytetrack.yaml"
+
+# ---------------------------------------------------------------------------
+# M3 MAC INFERENCE OPTIMISATIONS
+# ---------------------------------------------------------------------------
+
+# Metal Performance Shaders — uses the M3 GPU instead of CPU.
+# Set to "cpu" if you hit any MPS-related crash (rare on macOS 14+).
+INFERENCE_DEVICE = "mps"
+
+# YOLO inference resolution.  Even though the video is 1080p, YOLO detects
+# best at 640px and it saves significant GPU memory.  Do not change this.
+INFERENCE_IMGSZ = 640
+
+# Frame stride — only process every Nth frame.
+# At 30fps, FRAME_STRIDE=5 means ~6fps effective detection rate.
+# Traffic moves slowly enough that this is more than sufficient for counting,
+# and it cuts total processing time by ~80%.
+# Set to 1 to process every frame (accurate but ~5× slower).
+FRAME_STRIDE = 5
+
+# ---------------------------------------------------------------------------
+# TEST MODE
+# ---------------------------------------------------------------------------
+
+# When TEST_MODE is True (or --test flag is passed), the pipeline:
+#   1. Only processes the first TEST_DURATION_S seconds of each video.
+#   2. Pops up a window showing frame 0 with the ROI polygon and gate
+#      overlaid, so you can check your coordinates before committing to a
+#      full 10-minute run.
+# Leave this as False for production runs — use --test on the command line.
+TEST_MODE = False
+TEST_DURATION_S = 60   # seconds of video to process in test mode
 
 # How many consecutive frames to smooth speed over (rolling mean)
 SPEED_SMOOTH_FRAMES = 10

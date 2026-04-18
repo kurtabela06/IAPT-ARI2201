@@ -11,12 +11,6 @@ each one, producing:
   data/processed/yolo_output/<segment>_<slot>.csv          (1-min summary)
   data/processed/calibration/<segment>_<slot>_metrics.csv  (SUMO-ready)
 
-EMPTY FOLDER GUARD
-------------------
-If data/raw/video/ contains no video files the script exits immediately with:
-  CRITICAL: No video samples found in data/raw/video.
-  Please add 15-minute clips (e.g., regional_10am.mp4) to begin.
-
 NAMING CONVENTION
 -----------------
 Videos must be named   <segment>_<slot>.<ext>
@@ -30,25 +24,29 @@ Examples:
     regional_1pm.mp4
     valley_5pm.avi
 
-USAGE
------
-    cd malta-road-recovery
-    python main.py                          # default YOLOv8n, no preview
-    python main.py --preview                # open live OpenCV windows
-    python main.py --model yolov8s.pt       # better accuracy, slower
-    python main.py --no-metrics             # skip extract_metrics step
-    python main.py --no-roi                 # disable ROI masking (debug)
+QUICK START (beginners)
+-----------------------
+1. Drop your .mp4 clips into  data/raw/video/  with the naming above.
 
-CALIBRATION WORKFLOW (read before first run)
---------------------------------------------
-1. Add your 15-minute clips to  data/raw/video/
-2. Run:  python main.py --preview --model yolov8n.pt
-3. Watch the preview window.  Adjust the following in vision/config.py:
-     - ROI_POLYGONS     (replace placeholder coordinates with pixel clicks)
-     - GATE_Y_RATIOS    (move the gate line to the right position)
-     - CALIBRATION[*]["pixels_per_metre"]  (measure from a road feature)
-4. Re-run without --preview for the full batch run.
-5. Find outputs in data/processed/yolo_output/ and data/processed/calibration/
+2. Check your ROI and gate BEFORE the full run (saves a lot of time):
+       python main.py --test
+   This pops up a window on the first frame of each clip showing the
+   polygon and gate.  Edit vision/config.py until they look right.
+
+3. Run the full batch:
+       python main.py
+
+4. Find outputs in  data/processed/yolo_output/  and
+   data/processed/calibration/
+
+ALL OPTIONS
+-----------
+    python main.py                    # full run, headless, MPS GPU
+    python main.py --test             # first 60s + first-frame overlay
+    python main.py --preview          # live window during full run
+    python main.py --model yolov8s.pt # better accuracy, slower
+    python main.py --no-roi           # disable ROI masking (debug)
+    python main.py --no-metrics       # skip extract_metrics step
 """
 
 from __future__ import annotations
@@ -149,6 +147,12 @@ Examples:
         "--no-metrics", action="store_true",
         help="Skip the extract_metrics step (faster, just produces CSVs)",
     )
+    p.add_argument(
+        "--test", action="store_true",
+        help="TEST MODE: process only the first 60 seconds of each clip and "
+             "pop up a window showing the ROI + gate on the first frame. "
+             "Use this to verify your config.py coordinates before a full run.",
+    )
     return p
 
 
@@ -187,6 +191,7 @@ def main() -> None:
                 gate_ratio   = args.gate,
                 show_preview = args.preview,
                 use_roi      = not args.no_roi,
+                test_mode    = args.test,
             )
             result = {
                 "segment":     v["segment"],

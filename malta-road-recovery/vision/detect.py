@@ -16,26 +16,38 @@ Produces TWO output files per clip:
 Key calibration parameters live in vision/config.py — do NOT edit constants
 here; change them there instead.
 
-Usage (single clip)
--------------------
-    cd malta-road-recovery
-    python vision/detect.py \
-        --video   data/raw/video/regional_10am.mp4 \
-        --segment regional \
-        --slot    10am
+QUICK START (beginners)
+-----------------------
+Step 1: Drop your video into   data/raw/video/regional_10am.mp4
+        (naming: <segment>_<slot>.mp4   where segment = regional | valley)
 
-Options
--------
+Step 2: Run TEST MODE to check the ROI and gate look right on YOUR footage:
+    cd malta-road-recovery
+    python vision/detect.py --video data/raw/video/regional_10am.mp4 \
+        --segment regional --slot 10am --test
+
+    A window will pop up showing the first frame with the polygon and gate
+    drawn.  If they look wrong, edit vision/config.py and try again.
+
+Step 3: Once the overlay looks good, run the full clip (no --test flag):
+    python vision/detect.py --video data/raw/video/regional_10am.mp4 \
+        --segment regional --slot 10am
+
+    Or use main.py to process all clips at once:
+    python main.py
+
+All other options
+-----------------
     --model    yolov8n.pt | yolov8s.pt | yolov8m.pt  (default: from config)
     --gate     0.55   Y position as fraction of frame height (overrides config)
-    --preview         open a live OpenCV window (for gate/ROI verification)
+    --preview         open a live OpenCV window during the full run
     --no-roi          disable ROI masking (useful for debugging)
+    --test            process first 60 s only + show first-frame overlay
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -62,6 +74,10 @@ from vision.config import (          # noqa: E402
     ROI_POLYGONS,
     GATE_Y_RATIOS,
     PER_FRAME_COLUMNS,
+    INFERENCE_DEVICE,
+    INFERENCE_IMGSZ,
+    FRAME_STRIDE,
+    TEST_DURATION_S,
 )
 from vision.utils import (           # noqa: E402
     build_roi_mask,
@@ -85,35 +101,28 @@ class SpeedEstimator:
     """
     Converts frame-to-frame pixel displacement into km/h.
 
-    Parameters
-    ----------
-    pixels_per_metre : calibration constant — pixels that correspond to 1 metre
-    fps              : video frame rate
+    Because we skip frames with FRAME_STRIDE, the time between two
+    consecutive observations is  FRAME_STRIDE / fps  seconds, not  1 / fps.
+    Pass effective_fps = fps / FRAME_STRIDE to account for this.
     """
 
-    def __init__(self, pixels_per_metre: float, fps: float) -> None:
+    def __init__(self, pixels_per_metre: float, effective_fps: float) -> None:
         self.ppm = pixels_per_metre
-        self.fps = fps
+        self.fps = effective_fps
         self._prev: dict[int, tuple[float, float]] = {}
         self._buffer: dict[int, list[float]] = defaultdict(list)
 
     def update(self, track_id: int, cx: float, cy: float) -> float | None:
-        """
-        Returns the smoothed speed in km/h, or None on the first observation.
-
-        The raw speed is appended to a rolling buffer of SPEED_SMOOTH_FRAMES
-        values; the return value is the mean of that buffer.
-        """
+        """Returns smoothed speed in km/h, or None on first observation."""
         raw = None
         if track_id in self._prev:
             px, py = self._prev[track_id]
             pixel_dist = float(np.hypot(cx - px, cy - py))
             metres     = pixel_dist / self.ppm
-            speed_ms   = metres * self.fps          # metres per second
+            speed_ms   = metres * self.fps
             raw        = speed_ms * 3.6             # → km/h
 
-            # Sanity clamp: discard physically impossible spikes
-            # (> 180 km/h is almost certainly a tracker glitch)
+            # Discard physically impossible spikes (tracker glitch)
             if raw > 180:
                 raw = None
 
@@ -179,6 +188,64 @@ class BinAggregator:
 
 
 # ---------------------------------------------------------------------------
+# TEST-MODE FIRST-FRAME POPUP
+# ---------------------------------------------------------------------------
+
+def _show_test_overlay(
+    cap: cv2.VideoCapture,
+    gate: VirtualGate,
+    roi_polygon: list | None,
+    segment: str,
+    slot: str,
+) -> None:
+    """
+    Grab frame 0, draw the ROI polygon and gate line on it, then pop up
+    a window so the user can visually verify their calibration coordinates.
+    Pressing any key (or 'q') closes the window.
+    """
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ret, frame = cap.read()
+    if not ret:
+        print("[test] WARNING: Could not read first frame for overlay preview.")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return
+
+    if roi_polygon is not None:
+        draw_roi(frame, roi_polygon, label="ROI (edit in config.py)")
+
+    gate.draw(frame)
+
+    h, w = frame.shape[:2]
+    cv2.putText(
+        frame,
+        f"TEST MODE — {segment} / {slot}   Press any key to start processing...",
+        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2,
+    )
+    cv2.putText(
+        frame,
+        f"Frame size: {w}x{h}  |  Edit ROI/gate in vision/config.py",
+        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+    )
+
+    print("\n" + "="*60)
+    print("  TEST MODE — First-frame overlay")
+    print(f"  Frame size : {w} x {h}")
+    print(f"  Segment    : {segment}  |  Slot : {slot}")
+    print("  The window shows your ROI polygon and counting gate.")
+    print("  If they look wrong, close this window, edit vision/config.py,")
+    print("  and re-run with --test.")
+    print("  Press any key in the window to continue...")
+    print("="*60 + "\n")
+
+    cv2.imshow("TEST MODE — ROI & Gate Check (press any key)", frame)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    # Rewind so the main loop starts from frame 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+
+# ---------------------------------------------------------------------------
 # MAIN PIPELINE
 # ---------------------------------------------------------------------------
 
@@ -190,6 +257,7 @@ def run_pipeline(
     gate_ratio:   float | None = None,
     show_preview: bool  = False,
     use_roi:      bool  = True,
+    test_mode:    bool  = False,
 ) -> tuple[Path, Path]:
     """
     Run the full Phase 1 pipeline for one video clip.
@@ -199,10 +267,11 @@ def run_pipeline(
     video_path   : absolute path to the .mp4 / .avi file
     segment      : "regional" | "valley"
     slot         : time-slot label — "10am", "1pm", "5pm"
-    model_name   : YOLO weights file name (will be auto-downloaded if absent)
+    model_name   : YOLO weights file name (auto-downloaded if absent)
     gate_ratio   : override the gate Y-fraction from config (None = use config)
-    show_preview : open an OpenCV display window for visual verification
+    show_preview : open an OpenCV display window during the full run
     use_roi      : apply the ROI polygon mask (disable for debugging)
+    test_mode    : process only first 60 s + show first-frame overlay popup
 
     Returns
     -------
@@ -212,7 +281,7 @@ def run_pipeline(
     if not video_path.exists():
         sys.exit(
             f"CRITICAL: No video samples found in data/raw/video. "
-            f"Please add 15-minute clips (e.g., regional_10am.mp4) to begin."
+            f"Please add your .mp4 clips (e.g., regional_10am.mp4) to begin."
         )
 
     if segment not in CALIBRATION:
@@ -226,11 +295,16 @@ def run_pipeline(
     n_lanes = calib["lanes"]
 
     print(f"\n{'='*60}")
-    print(f"[detect] Segment : {segment.upper()}  ({n_lanes}-lane)")
-    print(f"[detect] Slot    : {slot}")
-    print(f"[detect] Video   : {video_path.name}")
-    print(f"[detect] PPM     : {ppm} px/m  "
-          f"(PLACEHOLDER — update vision/config.py after calibration)")
+    print(f"  Malta Road Recovery — Phase 1 Vision Pipeline")
+    print(f"{'='*60}")
+    print(f"  Segment  : {segment.upper()}  ({n_lanes}-lane road)")
+    print(f"  Slot     : {slot}")
+    print(f"  Video    : {video_path.name}")
+    print(f"  PPM      : {ppm} px/m  (update vision/config.py after calibration)")
+    if test_mode:
+        print(f"  Mode     : TEST — first {TEST_DURATION_S}s only")
+    else:
+        print(f"  Mode     : FULL RUN")
     print(f"{'='*60}\n")
 
     # --- Open video --------------------------------------------------------
@@ -238,13 +312,25 @@ def run_pipeline(
     if not cap.isOpened():
         sys.exit(f"CRITICAL: Cannot open video: {video_path}")
 
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"[detect] Resolution : {frame_w}×{frame_h}  |  FPS : {fps:.1f}  "
-          f"|  Total frames : {total_frames}")
+    # In test mode, cap the number of frames to process
+    max_frames = int(TEST_DURATION_S * fps) if test_mode else total_frames
+
+    # Effective FPS after frame striding — used for speed calculation
+    effective_fps = fps / FRAME_STRIDE
+
+    print(f"  Resolution  : {frame_w} x {frame_h}  (portrait: width x height)")
+    print(f"  FPS         : {fps:.1f}  |  Total frames : {total_frames}")
+    print(f"  Frame stride: every {FRAME_STRIDE} frames  "
+          f"({effective_fps:.1f} effective fps)")
+    print(f"  Device      : {INFERENCE_DEVICE.upper()}  |  Inference size : {INFERENCE_IMGSZ}px")
+    if test_mode:
+        print(f"  Processing  : first {max_frames} frames (~{TEST_DURATION_S}s)")
+    print()
 
     # --- Build ROI ---------------------------------------------------------
     roi_polygon = None
@@ -253,14 +339,13 @@ def run_pipeline(
     if use_roi and ROI_POLYGONS is not None and segment in ROI_POLYGONS:
         roi_polygon = ROI_POLYGONS[segment]
         roi_mask    = build_roi_mask((frame_h, frame_w), roi_polygon)
-        print(f"[detect] ROI     : {len(roi_polygon)}-point polygon  "
-              f"(PLACEHOLDER — update config.py after measuring)")
+        print(f"  ROI : {len(roi_polygon)}-point polygon active  "
+              f"(edit coordinates in vision/config.py)")
     else:
-        print("[detect] ROI     : DISABLED")
+        print("  ROI : DISABLED")
 
     # --- Build gate --------------------------------------------------------
     if gate_ratio is not None:
-        # CLI override — bypass config
         gate_y = int(frame_h * gate_ratio)
         gate   = VirtualGate(
             y_position  = gate_y,
@@ -272,20 +357,26 @@ def run_pipeline(
         gate = make_gate(segment, frame_h, frame_w, "primary")
         gate_y = gate.y
 
-    print(f"[detect] Gate Y  : {gate_y}px  ({gate_y/frame_h:.0%} of frame height)\n")
+    print(f"  Gate Y : {gate_y}px  ({gate_y/frame_h:.0%} of frame height)\n")
 
-    # --- Initialise components ---------------------------------------------
-    model      = YOLO(model_name)
-    estimator  = SpeedEstimator(ppm, fps)
+    # --- TEST MODE: show first-frame overlay before processing -------------
+    if test_mode:
+        _show_test_overlay(cap, gate, roi_polygon, segment, slot)
+
+    # --- Load YOLO model ---------------------------------------------------
+    print(f"  Loading YOLO model '{model_name}' on {INFERENCE_DEVICE.upper()}...")
+    model = YOLO(model_name)
+    print("  Model ready.\n")
+
+    # --- Initialise pipeline components ------------------------------------
+    estimator  = SpeedEstimator(ppm, effective_fps)
     aggregator = BinAggregator()
 
-    # Per-frame rows: frame, id, class, speed_kph, entry_time
     per_frame_rows: list[dict] = []
+    entry_logged:   set[int]   = set()
 
-    # Track which IDs have already been recorded as "entry" events
-    entry_logged: set[int] = set()
-
-    frame_idx = 0
+    frame_idx     = 0   # absolute frame counter
+    processed     = 0   # frames actually sent to YOLO
 
     # --- Frame loop --------------------------------------------------------
     while True:
@@ -293,18 +384,34 @@ def run_pipeline(
         if not ret:
             break
 
+        # Test mode: stop after the configured duration
+        if test_mode and frame_idx >= max_frames:
+            print(f"\n  [test] Reached {TEST_DURATION_S}s limit — stopping early.")
+            break
+
         timestamp_s = frame_idx / fps
 
-        # Apply ROI mask to frame before YOLO inference
-        inference_frame = apply_roi_mask(frame, roi_mask) if roi_mask is not None else frame
+        # FRAME STRIDE — skip frames to save GPU time
+        if frame_idx % FRAME_STRIDE != 0:
+            frame_idx += 1
+            continue
 
-        # YOLO + ByteTrack
+        processed += 1
+
+        # Apply ROI mask to frame before YOLO inference
+        inference_frame = (
+            apply_roi_mask(frame, roi_mask) if roi_mask is not None else frame
+        )
+
+        # YOLO + ByteTrack — MPS GPU, fixed 640px inference size
         results = model.track(
             inference_frame,
             persist          = True,
             classes          = list(VEHICLE_CLASSES.keys()),
             tracker          = TRACKER_CFG,
             conf             = CONFIDENCE_THRESHOLD,
+            imgsz            = INFERENCE_IMGSZ,
+            device           = INFERENCE_DEVICE,
             verbose          = False,
         )
 
@@ -323,14 +430,13 @@ def run_pipeline(
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
 
-                # Secondary ROI check on the raw centroid
+                # Secondary ROI check on the centroid
                 if roi_polygon and not centroid_in_roi(x1, y1, x2, y2, roi_polygon):
                     continue
 
-                # Speed estimation
                 speed = estimator.update(track_id, cx, cy)
 
-                # --- Per-frame CSV row ------------------------------------
+                # Buffer per-frame row (written to CSV once at the end)
                 per_frame_rows.append({
                     "frame":      frame_idx,
                     "id":         track_id,
@@ -339,7 +445,7 @@ def run_pipeline(
                     "entry_time": round(timestamp_s, 3),
                 })
 
-                # --- Gate crossing check ----------------------------------
+                # Gate crossing detection
                 crossing: GateCrossing | None = gate.update(
                     track_id    = track_id,
                     cx          = cx,
@@ -361,8 +467,8 @@ def run_pipeline(
                             f"dir={crossing.direction}"
                         )
 
-                # --- Preview annotation -----------------------------------
-                if show_preview:
+                # Preview annotation (only shown during --preview or --test)
+                if show_preview or test_mode:
                     cv2.rectangle(
                         frame,
                         (int(x1), int(y1)), (int(x2), int(y2)),
@@ -376,8 +482,8 @@ def run_pipeline(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1,
                     )
 
-        # Overlay gate and ROI on preview
-        if show_preview:
+        # Live preview window (headless by default — only with --preview/--test)
+        if show_preview or test_mode:
             gate.draw(frame)
             cv2.putText(
                 frame,
@@ -386,29 +492,33 @@ def run_pipeline(
             )
             cv2.imshow("Malta Road Recovery — Phase 1 Preview", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[detect] Preview closed by user.")
+                print("  [detect] Preview closed by user.")
                 break
 
         frame_idx += 1
-        if frame_idx % 500 == 0:
-            pct = 100 * frame_idx / max(total_frames, 1)
-            print(f"  ... {frame_idx}/{total_frames} frames ({pct:.0f}%)")
+
+        # Progress update every 500 processed frames
+        if processed % 500 == 0:
+            pct = 100 * frame_idx / max(max_frames, 1)
+            elapsed_s = frame_idx / fps
+            print(f"  ... {frame_idx}/{max_frames} frames  "
+                  f"({pct:.0f}%)  t={elapsed_s:.0f}s")
 
     cap.release()
-    if show_preview:
+    if show_preview or test_mode:
         cv2.destroyAllWindows()
 
     aggregator.finalise(frame_idx / fps)
 
-    # --- Write per-frame CSV -----------------------------------------------
+    # --- Write per-frame CSV (all rows buffered in memory, one write) ------
     frames_path = OUTPUT_DIR / f"{segment}_{slot}_frames.csv"
     df_frames   = pd.DataFrame(per_frame_rows, columns=PER_FRAME_COLUMNS)
     df_frames.to_csv(frames_path, index=False)
-    print(f"\n[detect] Per-frame CSV : {frames_path}")
-    print(f"         {len(df_frames)} rows  |  "
-          f"{df_frames['id'].nunique()} unique track IDs")
 
-    # --- Write summary CSV -------------------------------------------------
+    print(f"\n  Per-frame CSV : {frames_path}")
+    print(f"  {len(df_frames)} rows  |  {df_frames['id'].nunique()} unique track IDs")
+
+    # --- Write summary CSV (one write at the end) --------------------------
     summary_path = OUTPUT_DIR / f"{segment}_{slot}.csv"
     df_summary   = pd.DataFrame(aggregator.rows)
 
@@ -418,8 +528,8 @@ def run_pipeline(
         df_summary.insert(2, "n_lanes",  n_lanes)
 
     df_summary.to_csv(summary_path, index=False)
-    print(f"[detect] Summary CSV   : {summary_path}")
-    print(f"         {len(df_summary)} 1-minute bins\n")
+    print(f"  Summary CSV   : {summary_path}")
+    print(f"  {len(df_summary)} 1-minute bin(s)\n")
 
     if not df_summary.empty:
         print(f"  Peak gate flow : {df_summary['vehicle_count'].max()} veh/min")
@@ -435,23 +545,65 @@ def run_pipeline(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Malta Road Recovery — Phase 1: detect & track one video clip"
+        description=(
+            "Malta Road Recovery — Phase 1: detect & track one video clip.\n\n"
+            "BEGINNERS: start with --test to check your ROI and gate position\n"
+            "before running the full 10-minute clip."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Check ROI/gate on first frame (recommended first step):
+  python vision/detect.py --video data/raw/video/regional_10am.mp4 \\
+      --segment regional --slot 10am --test
+
+  # Full run (no window, fast):
+  python vision/detect.py --video data/raw/video/regional_10am.mp4 \\
+      --segment regional --slot 10am
+
+  # Full run with live preview (slower, good for verification):
+  python vision/detect.py --video data/raw/video/regional_10am.mp4 \\
+      --segment regional --slot 10am --preview
+        """,
     )
-    p.add_argument("--video",    required=True, type=Path,
-                   help="e.g. data/raw/video/regional_10am.mp4")
-    p.add_argument("--segment",  required=True,
-                   choices=list(CALIBRATION.keys()),
-                   help="Road segment: regional | valley")
-    p.add_argument("--slot",     required=True,
-                   help="Time-slot label: 10am | 1pm | 5pm")
-    p.add_argument("--model",    default=DEFAULT_MODEL,
-                   help=f"YOLO weights (default: {DEFAULT_MODEL})")
-    p.add_argument("--gate",     default=None, type=float,
-                   help="Gate Y as fraction of frame height — overrides config")
-    p.add_argument("--preview",  action="store_true",
-                   help="Show live preview window (for gate/ROI verification)")
-    p.add_argument("--no-roi",   action="store_true",
-                   help="Disable ROI masking (debug mode)")
+    p.add_argument(
+        "--video", required=True, type=Path,
+        help="Path to your video file, e.g. data/raw/video/regional_10am.mp4",
+    )
+    p.add_argument(
+        "--segment", required=True, choices=list(CALIBRATION.keys()),
+        help="Which road: regional | valley",
+    )
+    p.add_argument(
+        "--slot", required=True,
+        help="Time label for this clip: 10am | 1pm | 5pm (or any text)",
+    )
+    p.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"YOLO weights to use (default: {DEFAULT_MODEL}). "
+             "Try yolov8s.pt for better accuracy at a speed cost.",
+    )
+    p.add_argument(
+        "--gate", default=None, type=float,
+        help="Gate Y as a fraction of frame height (0.0–1.0). "
+             "Overrides the value in config.py.  Example: 0.55",
+    )
+    p.add_argument(
+        "--preview", action="store_true",
+        help="Show a live preview window during the full run "
+             "(slower — only use for verification).",
+    )
+    p.add_argument(
+        "--no-roi", action="store_true",
+        help="Disable ROI masking.  Useful if you want to see all detections "
+             "before deciding where to draw your polygon.",
+    )
+    p.add_argument(
+        "--test", action="store_true",
+        help="TEST MODE: process only the first 60 seconds and pop up a "
+             "window showing the ROI + gate on the first frame.  "
+             "Use this to check your config.py coordinates quickly.",
+    )
     return p
 
 
@@ -465,6 +617,7 @@ def main() -> None:
         gate_ratio   = args.gate,
         show_preview = args.preview,
         use_roi      = not args.no_roi,
+        test_mode    = args.test,
     )
 
 
