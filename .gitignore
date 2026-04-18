@@ -1,0 +1,6 @@
+# Ignore all videos in the raw folder
+malta-road-recovery/data/raw/video/*.MP4
+malta-road-recovery/data/raw/video/*.mp4
+
+# Ignore Mac system files
+.DS_Store
