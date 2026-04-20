@@ -63,8 +63,7 @@ CALIBRATION: dict[str, dict] = {
     "regional": {
         # Regional Road — Twin-Carriageway / Tunnel Entrance section
         # Approx. 2 lanes, lane width ~3.5 m each.
-        # PLACEHOLDER: measure from your footage and update (see Step 2 above).
-        "pixels_per_metre": 8.5,   # <-- REPLACE after measuring
+        "pixels_per_metre": 25,
         "lanes": 2,
         "approx_road_width_m": 7,  # includes some shoulder area, not just lane width
     },
@@ -87,44 +86,64 @@ PIXELS_PER_METRE = {seg: v["pixels_per_metre"] for seg, v in CALIBRATION.items()
 # Each polygon is a list of (x, y) pixel tuples.
 # These are PLACEHOLDER coordinates — replace after Step 3.
 #
-# How to read the placeholders:
-#   "regional" : a wide trapezoid covering both carriageways of the
-#                Regional Road tunnel entrance.
-#   "valley"   : a narrow trapezoid covering the single lane on Valley Road.
+# COORDINATE INPUT CONVENTION
+# ---------------------------
+# Native (post-rotation) frame is 1080 wide × 1920 tall (portrait).
+# Calibration measurements are taken on a 605 × 1080 display window, so
+# every coordinate below is entered in that smaller frame and scaled up
+# at load time:
+#     native_x = measured_x * SCALING_FACTOR_X   (605  → 1080)
+#     native_y = measured_y * SCALING_FACTOR_Y   (1080 → 1920)
 #
-# IMPORTANT: These coordinates assume a 1920×1080 source frame.
-#            If your clips are a different resolution, either:
-#              (a) re-measure from your actual frame, OR
-#              (b) set ROI_POLYGONS = None to disable masking entirely
-#                  and re-enable once you have measured coordinates.
+# The same SCALING_FACTOR_X is also applied to pixels-per-metre at runtime
+# (see detect.py) so a PPM measured on the 605px view produces correct
+# speeds on the 1080px native frame.
 #
 # To disable ROI masking temporarily:   ROI_POLYGONS = None
 
-ROI_POLYGONS: dict[str, list[tuple[int, int]]] | None = {
+CALIBRATION_VIEW_WIDTH  = 605    # px — width of the window where coords were measured
+CALIBRATION_VIEW_HEIGHT = 1080   # px — height of the window where coords were measured
+NATIVE_FRAME_WIDTH      = 1080   # px — width of the raw portrait frame (post-rotation)
+NATIVE_FRAME_HEIGHT     = 1920   # px — height of the raw portrait frame (post-rotation)
+
+SCALING_FACTOR_X = NATIVE_FRAME_WIDTH  / CALIBRATION_VIEW_WIDTH    # ≈ 1.7851
+SCALING_FACTOR_Y = NATIVE_FRAME_HEIGHT / CALIBRATION_VIEW_HEIGHT   # ≈ 1.7778
+
+
+def _scale_polygon(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Scale measured (x, y) from the 605×1080 calibration view to the 1080×1920 native frame."""
+    return [
+        (int(round(x * SCALING_FACTOR_X)), int(round(y * SCALING_FACTOR_Y)))
+        for x, y in points
+    ]
+
+
+# All coordinates below are measured on the 605 × 1080 calibration view.
+_ROI_POLYGONS_RAW: dict[str, list[tuple[int, int]]] = {
     "regional": [
         # ┌─────────────────────────────────────────────────────────────────┐
         # │  Regional Road — Double Lane — Tunnel Entrance                  │
-        # │  PLACEHOLDER  (1080 × 1920 portrait frame)                      │
-        # │  x: 0 = left edge, 1080 = right edge                           │
-        # │  y: 0 = top  edge, 1920 = bottom edge                          │
-        # │  Run --test to see these overlaid on the first frame, then      │
-        # │  replace with your actual corner clicks.                        │
+        # │  Coords measured on the 605 × 1080 calibration view.            │
         # └─────────────────────────────────────────────────────────────────┘
-        (100, 500),   # top-left  corner of road area
-        (980, 500),   # top-right corner
-        (980, 1700),  # bottom-right corner
-        (100, 1700),  # bottom-left corner
+        (200, 585),   # top-left  corner
+        (270, 585),   # top-right corner
+        (480, 850),   # bottom-right corner
+        (190, 850),   # bottom-left corner
     ],
     "valley": [
         # ┌─────────────────────────────────────────────────────────────────┐
         # │  Valley Road — Single Lane                                      │
-        # │  PLACEHOLDER  (1080 × 1920 portrait frame)                      │
+        # │  Coords measured on the 605 × 1080 calibration view.            │
         # └─────────────────────────────────────────────────────────────────┘
         (250, 500),   # top-left
         (830, 500),   # top-right
         (830, 1700),  # bottom-right
         (250, 1700),  # bottom-left
     ],
+}
+
+ROI_POLYGONS: dict[str, list[tuple[int, int]]] | None = {
+    seg: _scale_polygon(pts) for seg, pts in _ROI_POLYGONS_RAW.items()
 }
 
 # ---------------------------------------------------------------------------

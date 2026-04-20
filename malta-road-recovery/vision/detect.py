@@ -78,7 +78,12 @@ from vision.config import (          # noqa: E402
     INFERENCE_IMGSZ,
     FRAME_STRIDE,
     TEST_DURATION_S,
+    SCALING_FACTOR_X,
 )
+
+# Test-mode preview window size (width, height) — keeps the 1080×1920 frame
+# at a readable size on screen while we draw ROI/Gate on the native frame.
+TEST_DISPLAY_SIZE = (540, 960)
 from vision.utils import (           # noqa: E402
     build_roi_mask,
     apply_roi_mask,
@@ -91,6 +96,20 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "yolo_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 VIDEO_DIR = PROJECT_ROOT / "data" / "raw" / "video"
+
+
+# ---------------------------------------------------------------------------
+# ORIENTATION HELPERS
+# ---------------------------------------------------------------------------
+
+def _needs_portrait_rotation(frame_w: int, frame_h: int) -> bool:
+    """True if the decoded frame arrives in landscape and must be rotated to portrait."""
+    return frame_h < frame_w
+
+
+def _to_portrait(frame: np.ndarray) -> np.ndarray:
+    """Rotate a landscape frame 90° clockwise into portrait orientation."""
+    return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
 
 # ---------------------------------------------------------------------------
@@ -197,11 +216,12 @@ def _show_test_overlay(
     roi_polygon: list | None,
     segment: str,
     slot: str,
+    rotate_to_portrait: bool = False,
 ) -> None:
     """
-    Grab frame 0, draw the ROI polygon and gate line on it, then pop up
-    a window so the user can visually verify their calibration coordinates.
-    Pressing any key (or 'q') closes the window.
+    Grab frame 0, draw the ROI polygon and gate line on the NATIVE-resolution
+    frame, then pop up a down-scaled window so the user can visually verify
+    their calibration coordinates.  Pressing any key closes the window.
     """
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     ret, frame = cap.read()
@@ -210,9 +230,13 @@ def _show_test_overlay(
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         return
 
+    if rotate_to_portrait:
+        frame = _to_portrait(frame)
+
+    # Draw overlays on the native 1080×1920 frame so scaled ROI coords land
+    # in the correct place relative to the footage.
     if roi_polygon is not None:
         draw_roi(frame, roi_polygon, label="ROI (edit in config.py)")
-
     gate.draw(frame)
 
     h, w = frame.shape[:2]
@@ -223,21 +247,24 @@ def _show_test_overlay(
     )
     cv2.putText(
         frame,
-        f"Frame size: {w}x{h}  |  Edit ROI/gate in vision/config.py",
+        f"Native frame: {w}x{h}  |  Edit ROI/gate in vision/config.py",
         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
     )
 
+    # Down-scale for display only — overlays stay faithful to the native frame.
+    display_frame = cv2.resize(frame, TEST_DISPLAY_SIZE, interpolation=cv2.INTER_AREA)
+
     print("\n" + "="*60)
     print("  TEST MODE — First-frame overlay")
-    print(f"  Frame size : {w} x {h}")
-    print(f"  Segment    : {segment}  |  Slot : {slot}")
+    print(f"  Native frame : {w} x {h}   Display : {TEST_DISPLAY_SIZE[0]} x {TEST_DISPLAY_SIZE[1]}")
+    print(f"  Segment      : {segment}  |  Slot : {slot}")
     print("  The window shows your ROI polygon and counting gate.")
     print("  If they look wrong, close this window, edit vision/config.py,")
     print("  and re-run with --test.")
     print("  Press any key in the window to continue...")
     print("="*60 + "\n")
 
-    cv2.imshow("TEST MODE — ROI & Gate Check (press any key)", frame)
+    cv2.imshow("TEST MODE — ROI & Gate Check (press any key)", display_frame)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
@@ -290,9 +317,11 @@ def run_pipeline(
             f"Expected one of: {list(CALIBRATION.keys())}"
         )
 
-    calib   = CALIBRATION[segment]
-    ppm     = calib["pixels_per_metre"]
-    n_lanes = calib["lanes"]
+    calib     = CALIBRATION[segment]
+    raw_ppm   = calib["pixels_per_metre"]
+    # PPM is measured on the 605px calibration view; scale to native 1080px width.
+    ppm       = raw_ppm * SCALING_FACTOR_X
+    n_lanes   = calib["lanes"]
 
     print(f"\n{'='*60}")
     print(f"  Malta Road Recovery — Phase 1 Vision Pipeline")
@@ -300,7 +329,8 @@ def run_pipeline(
     print(f"  Segment  : {segment.upper()}  ({n_lanes}-lane road)")
     print(f"  Slot     : {slot}")
     print(f"  Video    : {video_path.name}")
-    print(f"  PPM      : {ppm} px/m  (update vision/config.py after calibration)")
+    print(f"  PPM      : {raw_ppm} px/m (measured @605px) "
+          f"→ {ppm:.2f} px/m (native 1080px, x{SCALING_FACTOR_X:.3f})")
     if test_mode:
         print(f"  Mode     : TEST — first {TEST_DURATION_S}s only")
     else:
@@ -313,9 +343,21 @@ def run_pipeline(
         sys.exit(f"CRITICAL: Cannot open video: {video_path}")
 
     fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Some DJI clips decode in landscape even though the footage is portrait.
+    # Detect that here and rotate every frame 90° clockwise on read so the rest
+    # of the pipeline (ROI, gate, PPM) sees the 1080×1920 portrait orientation
+    # its coordinates were calibrated for.
+    rotate_to_portrait = _needs_portrait_rotation(raw_w, raw_h)
+    if rotate_to_portrait:
+        frame_w, frame_h = raw_h, raw_w
+        print(f"  Orientation : landscape {raw_w}×{raw_h} detected — "
+              "auto-rotating 90° CW to portrait")
+    else:
+        frame_w, frame_h = raw_w, raw_h
 
     # In test mode, cap the number of frames to process
     max_frames = int(TEST_DURATION_S * fps) if test_mode else total_frames
@@ -361,7 +403,7 @@ def run_pipeline(
 
     # --- TEST MODE: show first-frame overlay before processing -------------
     if test_mode:
-        _show_test_overlay(cap, gate, roi_polygon, segment, slot)
+        _show_test_overlay(cap, gate, roi_polygon, segment, slot, rotate_to_portrait)
 
     # --- Load YOLO model ---------------------------------------------------
     print(f"  Loading YOLO model '{model_name}' on {INFERENCE_DEVICE.upper()}...")
@@ -383,6 +425,8 @@ def run_pipeline(
         ret, frame = cap.read()
         if not ret:
             break
+        if rotate_to_portrait:
+            frame = _to_portrait(frame)
 
         # Test mode: stop after the configured duration
         if test_mode and frame_idx >= max_frames:
@@ -490,7 +534,10 @@ def run_pipeline(
                 f"t={timestamp_s:.1f}s  seg={segment}  slot={slot}",
                 (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
             )
-            cv2.imshow("Malta Road Recovery — Phase 1 Preview", frame)
+            # Frame is already in native portrait orientation (rotated on read
+            # if the source was landscape); just down-scale for a readable window.
+            display_frame = cv2.resize(frame, TEST_DISPLAY_SIZE, interpolation=cv2.INTER_AREA)
+            cv2.imshow("Malta Road Recovery — Phase 1 Preview", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("  [detect] Preview closed by user.")
                 break
