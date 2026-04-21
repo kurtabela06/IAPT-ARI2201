@@ -78,7 +78,8 @@ from vision.config import (          # noqa: E402
     INFERENCE_IMGSZ,
     FRAME_STRIDE,
     TEST_DURATION_S,
-    SCALING_FACTOR_X,
+    scaling_factor_x,
+    CALIBRATION_VIEWS,
 )
 
 # Test-mode preview window size (width, height) — keeps the 1080×1920 frame
@@ -90,7 +91,12 @@ from vision.utils import (           # noqa: E402
     centroid_in_roi,
     draw_roi,
 )
-from vision.virtual_gates import VirtualGate, GateCrossing, make_gate  # noqa: E402
+from vision.virtual_gates import (   # noqa: E402
+    VirtualGate,
+    SpeedTrap,
+    TrapCrossing,
+    make_speed_trap,
+)
 
 OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "yolo_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -212,7 +218,7 @@ class BinAggregator:
 
 def _show_test_overlay(
     cap: cv2.VideoCapture,
-    gate: VirtualGate,
+    trap: SpeedTrap,
     roi_polygon: list | None,
     segment: str,
     slot: str,
@@ -237,7 +243,7 @@ def _show_test_overlay(
     # in the correct place relative to the footage.
     if roi_polygon is not None:
         draw_roi(frame, roi_polygon, label="ROI (edit in config.py)")
-    gate.draw(frame)
+    trap.draw(frame)
 
     h, w = frame.shape[:2]
     cv2.putText(
@@ -319,9 +325,11 @@ def run_pipeline(
 
     calib     = CALIBRATION[segment]
     raw_ppm   = calib["pixels_per_metre"]
-    # PPM is measured on the 605px calibration view; scale to native 1080px width.
-    ppm       = raw_ppm * SCALING_FACTOR_X
-    n_lanes   = calib["lanes"]
+    # PPM is measured on this segment's own calibration view; scale to native 1080px width.
+    seg_scale_x = scaling_factor_x(segment)
+    ppm         = raw_ppm * seg_scale_x
+    n_lanes     = calib["lanes"]
+    view_w, _   = CALIBRATION_VIEWS[segment]
 
     print(f"\n{'='*60}")
     print(f"  Malta Road Recovery — Phase 1 Vision Pipeline")
@@ -329,8 +337,8 @@ def run_pipeline(
     print(f"  Segment  : {segment.upper()}  ({n_lanes}-lane road)")
     print(f"  Slot     : {slot}")
     print(f"  Video    : {video_path.name}")
-    print(f"  PPM      : {raw_ppm} px/m (measured @605px) "
-          f"→ {ppm:.2f} px/m (native 1080px, x{SCALING_FACTOR_X:.3f})")
+    print(f"  PPM      : {raw_ppm} px/m (measured @{view_w}px) "
+          f"→ {ppm:.2f} px/m (native 1080px, x{seg_scale_x:.3f})")
     if test_mode:
         print(f"  Mode     : TEST — first {TEST_DURATION_S}s only")
     else:
@@ -386,24 +394,26 @@ def run_pipeline(
     else:
         print("  ROI : DISABLED")
 
-    # --- Build gate --------------------------------------------------------
+    # --- Build dual-gate speed trap ---------------------------------------
+    trap = make_speed_trap(segment, frame_h, frame_w)
+    # Honour the --gate override by shifting the entry line only; the exit
+    # line stays at its configured position.
     if gate_ratio is not None:
-        gate_y = int(frame_h * gate_ratio)
-        gate   = VirtualGate(
-            y_position  = gate_y,
+        trap.entry = VirtualGate(
+            y_position  = int(frame_h * gate_ratio),
             frame_width = frame_w,
-            label       = f"{segment} gate",
+            label       = f"{segment} — gate_entry",
+            colour      = trap.entry.colour,
             roi_polygon = roi_polygon,
         )
-    else:
-        gate = make_gate(segment, frame_h, frame_w, "primary")
-        gate_y = gate.y
 
-    print(f"  Gate Y : {gate_y}px  ({gate_y/frame_h:.0%} of frame height)\n")
+    print(f"  Gate entry : {trap.entry.y}px  ({trap.entry.y/frame_h:.0%})   "
+          f"Gate exit : {trap.exit.y}px  ({trap.exit.y/frame_h:.0%})")
+    print(f"  Gate dist  : {trap.gate_distance_m:.1f} m  (real-world)\n")
 
     # --- TEST MODE: show first-frame overlay before processing -------------
     if test_mode:
-        _show_test_overlay(cap, gate, roi_polygon, segment, slot, rotate_to_portrait)
+        _show_test_overlay(cap, trap, roi_polygon, segment, slot, rotate_to_portrait)
 
     # --- Load YOLO model ---------------------------------------------------
     print(f"  Loading YOLO model '{model_name}' on {INFERENCE_DEVICE.upper()}...")
@@ -411,6 +421,8 @@ def run_pipeline(
     print("  Model ready.\n")
 
     # --- Initialise pipeline components ------------------------------------
+    # SpeedEstimator remains available for legacy per-frame speed logging,
+    # but authoritative speed comes from the dual-gate trap below.
     estimator  = SpeedEstimator(ppm, effective_fps)
     aggregator = BinAggregator()
 
@@ -480,35 +492,43 @@ def run_pipeline(
 
                 speed = estimator.update(track_id, cx, cy)
 
-                # Buffer per-frame row (written to CSV once at the end)
+                # Buffer per-frame row (speed filled in when the trap fires)
                 per_frame_rows.append({
                     "frame":      frame_idx,
                     "id":         track_id,
                     "class":      class_name,
-                    "speed_kph":  round(speed, 2) if speed is not None else "",
+                    "speed_kph":  "",
                     "entry_time": round(timestamp_s, 3),
                 })
 
-                # Gate crossing detection
-                crossing: GateCrossing | None = gate.update(
+                # Dual-gate speed-trap update (entry latch on top line,
+                # speed computed on exit-line crossing).
+                trap_event: TrapCrossing | None = trap.update(
                     track_id    = track_id,
                     cx          = cx,
                     cy          = cy,
                     timestamp_s = timestamp_s,
                     class_name  = class_name,
-                    speed_kph   = speed,
                     frame_idx   = frame_idx,
                 )
 
-                if crossing is not None:
-                    aggregator.add(timestamp_s, class_name, speed)
+                if trap_event is not None:
+                    trap_speed = trap_event.speed_kph  # None if no entry seen
+                    # Stamp the trap speed onto this frame's row for the CSV
+                    per_frame_rows[-1]["speed_kph"] = (
+                        trap_speed if trap_speed is not None else ""
+                    )
+                    aggregator.add(timestamp_s, class_name, trap_speed)
                     if track_id not in entry_logged:
                         entry_logged.add(track_id)
+                        speed_str = (
+                            "N/A (no entry)" if trap_speed is None
+                            else f"{trap_speed:>5.1f} km/h"
+                        )
                         print(
-                            f"  [gate] t={timestamp_s:>7.1f}s  "
+                            f"  [trap] t={timestamp_s:>7.1f}s  "
                             f"ID={track_id:<4}  {class_name:<12}  "
-                            f"{'N/A' if speed is None else f'{speed:>5.1f} km/h'}  "
-                            f"dir={crossing.direction}"
+                            f"{speed_str}  dir={trap_event.direction}"
                         )
 
                 # Preview annotation (only shown during --preview or --test)
@@ -528,7 +548,7 @@ def run_pipeline(
 
         # Live preview window (headless by default — only with --preview/--test)
         if show_preview or test_mode:
-            gate.draw(frame)
+            trap.draw(frame)
             cv2.putText(
                 frame,
                 f"t={timestamp_s:.1f}s  seg={segment}  slot={slot}",

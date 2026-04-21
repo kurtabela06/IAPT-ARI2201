@@ -62,18 +62,15 @@ Step 5 — Re-run with --test to visually confirm your edits, then run the
 CALIBRATION: dict[str, dict] = {
     "regional": {
         # Regional Road — Twin-Carriageway / Tunnel Entrance section
-        # Approx. 2 lanes, lane width ~3.5 m each.
-        "pixels_per_metre": 25,
+        "pixels_per_metre": 28,
         "lanes": 2,
-        "approx_road_width_m": 7,  # includes some shoulder area, not just lane width
+        "approx_road_width_m": 7,
     },
     "valley": {
         # Valley Road — Single-Lane section
-        # Approx. 1 lane, road width ~3.5 m.
-        # PLACEHOLDER: measure from your footage and update (see Step 2 above).
-        "pixels_per_metre": 10.2,  # <-- REPLACE after measuring
+        "pixels_per_metre": 33,  # CHANGE
         "lanes": 1,
-        "approx_road_width_m": 3.0,  # single lane with no shoulder
+        "approx_road_width_m": 3.0,
     },
 }
 
@@ -83,42 +80,69 @@ PIXELS_PER_METRE = {seg: v["pixels_per_metre"] for seg, v in CALIBRATION.items()
 # ---------------------------------------------------------------------------
 # REGION OF INTEREST (ROI) POLYGONS
 # ---------------------------------------------------------------------------
-# Each polygon is a list of (x, y) pixel tuples.
-# These are PLACEHOLDER coordinates — replace after Step 3.
+# Native (post-rotation) frame is 1080 wide × 1920 tall (portrait) for both
+# segments.  Calibration was done in different display windows per segment,
+# so each segment carries its own view size and its own scaling factors:
 #
-# COORDINATE INPUT CONVENTION
-# ---------------------------
-# Native (post-rotation) frame is 1080 wide × 1920 tall (portrait).
-# Calibration measurements are taken on a 605 × 1080 display window, so
-# every coordinate below is entered in that smaller frame and scaled up
-# at load time:
-#     native_x = measured_x * SCALING_FACTOR_X   (605  → 1080)
-#     native_y = measured_y * SCALING_FACTOR_Y   (1080 → 1920)
+#     native_x = measured_x * scale_x   (view_width  → 1080)
+#     native_y = measured_y * scale_y   (view_height → 1920)
 #
-# The same SCALING_FACTOR_X is also applied to pixels-per-metre at runtime
-# (see detect.py) so a PPM measured on the 605px view produces correct
-# speeds on the 1080px native frame.
+# The segment's scale_x is also applied to its pixels-per-metre at runtime
+# (see detect.py), so a PPM measured on that view produces correct speeds
+# on the 1080p native frame.
 #
 # To disable ROI masking temporarily:   ROI_POLYGONS = None
 
-CALIBRATION_VIEW_WIDTH  = 605    # px — width of the window where coords were measured
-CALIBRATION_VIEW_HEIGHT = 1080   # px — height of the window where coords were measured
-NATIVE_FRAME_WIDTH      = 1080   # px — width of the raw portrait frame (post-rotation)
-NATIVE_FRAME_HEIGHT     = 1920   # px — height of the raw portrait frame (post-rotation)
+NATIVE_FRAME_WIDTH  = 1080   # px — width of the raw portrait frame (post-rotation)
+NATIVE_FRAME_HEIGHT = 1920   # px — height of the raw portrait frame (post-rotation)
 
-SCALING_FACTOR_X = NATIVE_FRAME_WIDTH  / CALIBRATION_VIEW_WIDTH    # ≈ 1.7851
-SCALING_FACTOR_Y = NATIVE_FRAME_HEIGHT / CALIBRATION_VIEW_HEIGHT   # ≈ 1.7778
-
-
-def _scale_polygon(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Scale measured (x, y) from the 605×1080 calibration view to the 1080×1920 native frame."""
-    return [
-        (int(round(x * SCALING_FACTOR_X)), int(round(y * SCALING_FACTOR_Y)))
-        for x, y in points
-    ]
+# Per-segment calibration-view dimensions (px).  Everything measured for
+# that segment — ROI corners, PPM — was taken in this window size.
+CALIBRATION_VIEWS: dict[str, tuple[int, int]] = {
+    "regional": (605, 1080),   # Regional Road measurements taken here
+    "valley":   (510,  910),   # Valley Road measurements taken here
+}
 
 
-# All coordinates below are measured on the 605 × 1080 calibration view.
+def _segment_scales(segment: str) -> tuple[float, float]:
+    """Return (scale_x, scale_y) that map this segment's calibration view to the native frame."""
+    view_w, view_h = CALIBRATION_VIEWS[segment]
+    return NATIVE_FRAME_WIDTH / view_w, NATIVE_FRAME_HEIGHT / view_h
+
+
+# Convenience look-ups, populated once at import time
+SCALING_FACTORS: dict[str, tuple[float, float]] = {
+    seg: _segment_scales(seg) for seg in CALIBRATION_VIEWS
+}
+
+
+def scaling_factor_x(segment: str) -> float:
+    """X-axis calibration-view → native-frame scale for a segment."""
+    return SCALING_FACTORS[segment][0]
+
+
+def scaling_factor_y(segment: str) -> float:
+    """Y-axis calibration-view → native-frame scale for a segment."""
+    return SCALING_FACTORS[segment][1]
+
+
+# Backwards-compatible defaults (regional view, kept for any legacy imports)
+SCALING_FACTOR_X = scaling_factor_x("regional")
+SCALING_FACTOR_Y = scaling_factor_y("regional")
+
+
+def _scale_polygon(
+    segment: str,
+    points: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Scale measured (x, y) from a segment's calibration view to the native frame."""
+    sx, sy = SCALING_FACTORS[segment]
+    return [(int(round(x * sx)), int(round(y * sy))) for x, y in points]
+
+
+# ROI corners are ENTERED in each segment's own calibration view (see
+# CALIBRATION_VIEWS above) and scaled to the 1080 × 1920 native frame at
+# load time via _scale_polygon().
 _ROI_POLYGONS_RAW: dict[str, list[tuple[int, int]]] = {
     "regional": [
         # ┌─────────────────────────────────────────────────────────────────┐
@@ -133,37 +157,48 @@ _ROI_POLYGONS_RAW: dict[str, list[tuple[int, int]]] = {
     "valley": [
         # ┌─────────────────────────────────────────────────────────────────┐
         # │  Valley Road — Single Lane                                      │
-        # │  Coords measured on the 605 × 1080 calibration view.            │
+        # │  Coords measured on the 510 × 910 calibration view.             │
         # └─────────────────────────────────────────────────────────────────┘
-        (250, 500),   # top-left
-        (830, 500),   # top-right
-        (830, 1700),  # bottom-right
-        (250, 1700),  # bottom-left
+        (290, 510),   # top-left
+        (370, 530),   # top-right
+        (200, 830),   # bottom-right
+        (0,   730),   # bottom-left
     ],
 }
 
 ROI_POLYGONS: dict[str, list[tuple[int, int]]] | None = {
-    seg: _scale_polygon(pts) for seg, pts in _ROI_POLYGONS_RAW.items()
+    seg: _scale_polygon(seg, pts) for seg, pts in _ROI_POLYGONS_RAW.items()
 }
 
 # ---------------------------------------------------------------------------
-# VIRTUAL GATE POSITIONS
+# DUAL-GATE SPEED TRAP
 # ---------------------------------------------------------------------------
-# Gate Y position expressed as a fraction of frame height (0.0 = top, 1.0 = bottom).
-# The gate spans the full width of the ROI polygon (not the full frame).
+# Each segment defines TWO horizontal gate lines — an entry gate and an
+# exit gate — separated by a known real-world distance on the road.
+# A vehicle's speed is derived from the time it takes to travel between
+# them (not from per-frame pixel motion):
 #
-# Rule of thumb: place the gate at roughly mid-frame so vehicles have had
-# time to stabilise their track ID before they cross.
+#     speed_mps = gate_distance_m / (exit_time_s - entry_time_s)
 #
-# GATE_Y_RATIOS["regional"]["primary"]  = 0.55  means 55% down the frame.
+# gate_entry / gate_exit : Y position as a fraction of NATIVE frame height
+#                          (0.0 = top, 1.0 = bottom).  Resolution-independent,
+#                          so these values do not need SCALING_FACTOR_Y.
+# gate_distance_m        : measured real-world distance (metres) between the
+#                          two gate lines on the road surface.
+#
+# Both lines must sit inside the ROI polygon and should be far enough apart
+# for the tracker to stabilise (a few vehicle lengths is a good rule).
 
 GATE_Y_RATIOS: dict[str, dict[str, float]] = {
     "regional": {
-        "primary":   0.55,   # main counting gate  — ADJUST if needed
-        "secondary": 0.75,   # optional second gate (unused in Phase 1 CSV)
+        "gate_entry":      0.6,
+        "gate_exit":       0.75,
+        "gate_distance_m": 15.0,
     },
     "valley": {
-        "primary":   0.50,   # ADJUST if needed
+        "gate_entry":      0.595,
+        "gate_exit":       0.785,
+        "gate_distance_m": 8.5, # CHANGE
     },
 }
 

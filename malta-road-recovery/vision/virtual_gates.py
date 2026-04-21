@@ -205,29 +205,32 @@ class VirtualGate:
 # FACTORY — build gates from config.py values
 # ---------------------------------------------------------------------------
 
+# BGR colours shared by the preview and speed-trap drawing code
+GATE_COLOURS: dict[str, tuple[int, int, int]] = {
+    "gate_entry": (255, 255, 0),   # CYAN (BGR)
+    "gate_exit":  (0, 255, 0),     # GREEN (BGR)
+}
+
+
 def make_gate(
     segment: str,
     frame_height: int,
     frame_width: int,
-    gate_name: str = "primary",
+    gate_name: str = "gate_entry",
 ) -> VirtualGate:
     """
-    Construct a VirtualGate using the calibration values in config.py.
+    Construct a single VirtualGate from config.py.
+
+    Gate Y ratios are expressed against the NATIVE post-rotation frame height,
+    so no SCALING_FACTOR_Y is applied here — the caller passes frame_height
+    for the already-oriented 1080×1920 frame.
 
     Parameters
     ----------
     segment      : "regional" | "valley"
     frame_height : pixel height of the video frame
     frame_width  : pixel width of the video frame
-    gate_name    : "primary" or "secondary"
-
-    Returns
-    -------
-    VirtualGate instance, ROI-aware if ROI_POLYGONS is not None.
-
-    Raises
-    ------
-    ValueError if segment or gate_name are not found in config.
+    gate_name    : "gate_entry" | "gate_exit"
     """
     seg_gates = GATE_Y_RATIOS.get(segment)
     if seg_gates is None:
@@ -248,18 +251,150 @@ def make_gate(
     if ROI_POLYGONS is not None:
         roi = ROI_POLYGONS.get(segment)
 
-    colours = {
-        "primary":   (0, 255, 0),
-        "secondary": (0, 180, 255),
-    }
-
     return VirtualGate(
         y_position  = y_px,
         frame_width = frame_width,
         label       = f"{segment} — {gate_name}",
-        colour      = colours.get(gate_name, (255, 255, 255)),
+        colour      = GATE_COLOURS.get(gate_name, (255, 255, 255)),
         roi_polygon = roi,
     )
+
+
+# ---------------------------------------------------------------------------
+# DUAL-GATE SPEED TRAP
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrapCrossing:
+    """Emitted when a tracked vehicle completes an entry → exit traversal.
+
+    speed_kph is None when the vehicle entered before tracking began (no
+    recorded entry_time), or when the measured dt is non-positive — we
+    still emit the event so the vehicle is counted, but skip the speed.
+    """
+    track_id:       int
+    entry_time_s:   Optional[float]
+    exit_time_s:    float
+    class_name:     str
+    speed_kph:      Optional[float]
+    direction:      str
+    frame_idx:      int
+
+
+class SpeedTrap:
+    """
+    Pair of virtual gates that together measure time-of-flight speed.
+
+    A vehicle's entry_time_s is recorded when it first crosses the entry
+    gate.  When the same track_id crosses the exit gate, the speed is
+    computed from the measured real-world gate distance and the elapsed
+    time.  If the exit crossing arrives with no recorded entry (vehicle
+    appeared mid-frame past the entry gate), speed is reported as None
+    to prevent infinite/invalid speed readings.
+    """
+
+    def __init__(
+        self,
+        entry_gate: VirtualGate,
+        exit_gate:  VirtualGate,
+        gate_distance_m: float,
+    ) -> None:
+        if gate_distance_m <= 0:
+            raise ValueError("gate_distance_m must be > 0")
+        self.entry = entry_gate
+        self.exit  = exit_gate
+        self.gate_distance_m = gate_distance_m
+        # track_id → entry timestamp (seconds).  Missing key = no entry seen.
+        self._entry_times: dict[int, float] = {}
+
+    def update(
+        self,
+        track_id:    int,
+        cx:          float,
+        cy:          float,
+        timestamp_s: float,
+        class_name:  str,
+        frame_idx:   int,
+    ) -> TrapCrossing | None:
+        """
+        Call once per tracked box per frame.  Returns a TrapCrossing only
+        when the vehicle crosses the EXIT gate; None otherwise (including
+        when it merely crosses the entry gate — that just latches the
+        entry timestamp).
+        """
+        # Entry-gate crossing: latch the timestamp, no event emitted.
+        entry_cross = self.entry.update(
+            track_id=track_id, cx=cx, cy=cy,
+            timestamp_s=timestamp_s, class_name=class_name,
+            frame_idx=frame_idx,
+        )
+        if entry_cross is not None and track_id not in self._entry_times:
+            self._entry_times[track_id] = timestamp_s
+
+        # Exit-gate crossing: compute speed if we saw the entry.
+        exit_cross = self.exit.update(
+            track_id=track_id, cx=cx, cy=cy,
+            timestamp_s=timestamp_s, class_name=class_name,
+            frame_idx=frame_idx,
+        )
+        if exit_cross is None:
+            return None
+
+        entry_ts = self._entry_times.pop(track_id, None)
+        speed_kph: float | None = None
+        if entry_ts is not None:
+            dt = timestamp_s - entry_ts
+            if dt > 0:
+                speed_mps = self.gate_distance_m / dt
+                speed_kph = round(speed_mps * 3.6, 2)
+
+        return TrapCrossing(
+            track_id     = track_id,
+            entry_time_s = entry_ts,
+            exit_time_s  = timestamp_s,
+            class_name   = class_name,
+            speed_kph    = speed_kph,
+            direction    = exit_cross.direction,
+            frame_idx    = frame_idx,
+        )
+
+    def forget(self, track_id: int) -> None:
+        self.entry.forget(track_id)
+        self.exit.forget(track_id)
+        self._entry_times.pop(track_id, None)
+
+    def draw(self, frame: np.ndarray) -> np.ndarray:
+        """Draw entry (cyan), exit (green), and the shared ROI polygon."""
+        self.entry.draw(frame)
+        # exit.draw() would re-draw the ROI; call just the gate parts
+        w = frame.shape[1]
+        cv2.line(frame, (0, self.exit.y), (w, self.exit.y), self.exit.colour, 2)
+        cv2.putText(
+            frame, self.exit.label,
+            (12, self.exit.y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.exit.colour, 1, cv2.LINE_AA,
+        )
+        return frame
+
+
+def make_speed_trap(
+    segment: str,
+    frame_height: int,
+    frame_width: int,
+) -> SpeedTrap:
+    """Build the configured dual-gate speed trap for a segment."""
+    seg_gates = GATE_Y_RATIOS.get(segment)
+    if seg_gates is None:
+        raise ValueError(f"No gate config for segment '{segment}'")
+    distance = seg_gates.get("gate_distance_m")
+    if distance is None:
+        raise ValueError(
+            f"Segment '{segment}' is missing gate_distance_m in config.py"
+        )
+
+    entry_gate = make_gate(segment, frame_height, frame_width, "gate_entry")
+    exit_gate  = make_gate(segment, frame_height, frame_width, "gate_exit")
+    return SpeedTrap(entry_gate, exit_gate, float(distance))
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +424,9 @@ def main() -> None:
     h, w = img.shape[:2]
     print(f"Frame size: {w}×{h}")
 
-    for gate_name in GATE_Y_RATIOS.get(args.segment, {}):
+    # Only iterate over actual gate Y-ratios (skip metadata like gate_distance_m)
+    gate_keys = [k for k in GATE_Y_RATIOS.get(args.segment, {}) if k.startswith("gate_") and k != "gate_distance_m"]
+    for gate_name in gate_keys:
         gate = make_gate(args.segment, h, w, gate_name)
         gate.draw(img)
         y_frac = GATE_Y_RATIOS[args.segment][gate_name]
