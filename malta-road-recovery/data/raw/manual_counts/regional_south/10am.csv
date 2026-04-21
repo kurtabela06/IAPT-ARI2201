@@ -1,0 +1,6 @@
+timestamp_bin,car_count,heavy_vehicle_count,avg_speed_kph,incident_status
+0,11,1,51.5,clear
+1,13,2,49.8,clear
+2,9,2,45.0,clear
+3,7,1,30.2,slow
+4,10,1,47.7,clear

@@ -381,19 +381,57 @@ def make_speed_trap(
     segment: str,
     frame_height: int,
     frame_width: int,
+    *,
+    gate_entry_ratio:  float | None = None,
+    gate_exit_ratio:   float | None = None,
+    gate_distance_m:   float | None = None,
+    roi_polygon:       list[tuple[int, int]] | None = None,
 ) -> SpeedTrap:
-    """Build the configured dual-gate speed trap for a segment."""
+    """
+    Build a dual-gate speed trap.
+
+    Uses config.py defaults unless keyword overrides are supplied (e.g. from
+    a per-video sidecar loaded by video_config.load_video_calibration).
+
+    Parameters
+    ----------
+    segment           : "regional" | "valley"
+    frame_height      : native frame height in px
+    frame_width       : native frame width in px
+    gate_entry_ratio  : Y fraction override for the entry line (0.0–1.0)
+    gate_exit_ratio   : Y fraction override for the exit line (0.0–1.0)
+    gate_distance_m   : real-world distance override (metres)
+    roi_polygon       : native-frame ROI polygon override; if None the
+                        segment default from config.py is used
+    """
     seg_gates = GATE_Y_RATIOS.get(segment)
     if seg_gates is None:
         raise ValueError(f"No gate config for segment '{segment}'")
-    distance = seg_gates.get("gate_distance_m")
-    if distance is None:
-        raise ValueError(
-            f"Segment '{segment}' is missing gate_distance_m in config.py"
-        )
 
-    entry_gate = make_gate(segment, frame_height, frame_width, "gate_entry")
-    exit_gate  = make_gate(segment, frame_height, frame_width, "gate_exit")
+    entry_ratio = gate_entry_ratio if gate_entry_ratio is not None else seg_gates["gate_entry"]
+    exit_ratio  = gate_exit_ratio  if gate_exit_ratio  is not None else seg_gates["gate_exit"]
+    distance    = gate_distance_m  if gate_distance_m  is not None else seg_gates.get("gate_distance_m")
+    if distance is None:
+        raise ValueError(f"Segment '{segment}' is missing gate_distance_m in config.py")
+
+    # ROI: use the supplied override, then config default, then None
+    if roi_polygon is None and ROI_POLYGONS is not None:
+        roi_polygon = ROI_POLYGONS.get(segment)
+
+    entry_gate = VirtualGate(
+        y_position  = int(frame_height * entry_ratio),
+        frame_width = frame_width,
+        label       = f"{segment} — gate_entry",
+        colour      = GATE_COLOURS["gate_entry"],
+        roi_polygon = roi_polygon,
+    )
+    exit_gate = VirtualGate(
+        y_position  = int(frame_height * exit_ratio),
+        frame_width = frame_width,
+        label       = f"{segment} — gate_exit",
+        colour      = GATE_COLOURS["gate_exit"],
+        roi_polygon = roi_polygon,
+    )
     return SpeedTrap(entry_gate, exit_gate, float(distance))
 
 
@@ -403,13 +441,21 @@ def make_speed_trap(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Preview gate and ROI positions on a still frame"
+        description=(
+            "Preview gate and ROI positions on a still frame.\n\n"
+            "If --video is given, the matching sidecar .yaml is loaded and its\n"
+            "calibration values are used instead of the config.py defaults."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--frame",   required=True, type=Path,
+    parser.add_argument("--frame",   required=True,  type=Path,
                         help="Path to a still JPEG/PNG captured from your video")
     parser.add_argument("--segment", required=True,
                         choices=list(GATE_Y_RATIOS.keys()),
                         help="Road segment: regional | valley")
+    parser.add_argument("--video",   default=None, type=Path,
+                        help="Path to the video this still came from — enables "
+                             "sidecar .yaml loading (e.g. data/raw/video/regional_10am.MP4)")
     parser.add_argument("--output",  type=Path, default=None,
                         help="Save annotated image to this path (optional)")
     args = parser.parse_args()
@@ -424,18 +470,41 @@ def main() -> None:
     h, w = img.shape[:2]
     print(f"Frame size: {w}×{h}")
 
-    # Only iterate over actual gate Y-ratios (skip metadata like gate_distance_m)
-    gate_keys = [k for k in GATE_Y_RATIOS.get(args.segment, {}) if k.startswith("gate_") and k != "gate_distance_m"]
-    for gate_name in gate_keys:
-        gate = make_gate(args.segment, h, w, gate_name)
-        gate.draw(img)
-        y_frac = GATE_Y_RATIOS[args.segment][gate_name]
-        print(f"  Gate '{gate_name}': y={gate.y}px  ({y_frac:.0%} of frame height)")
+    # --- Load calibration (sidecar if available, else global defaults) ------
+    if args.video is not None:
+        # Import here to avoid a circular import at module level
+        try:
+            from vision.video_config import load_video_calibration, describe
+        except ImportError:
+            from video_config import load_video_calibration, describe   # type: ignore
 
-    if ROI_POLYGONS and args.segment in ROI_POLYGONS:
-        print(f"  ROI polygon: {ROI_POLYGONS[args.segment]}")
+        vc = load_video_calibration(args.video, args.segment)
+        describe(vc)
+        trap = make_speed_trap(
+            args.segment, h, w,
+            gate_entry_ratio = vc.gate_entry_ratio,
+            gate_exit_ratio  = vc.gate_exit_ratio,
+            gate_distance_m  = vc.gate_distance_m,
+            roi_polygon      = vc.roi_polygon,
+        )
+        roi_polygon = vc.roi_polygon
     else:
-        print("  ROI polygon: DISABLED (set ROI_POLYGONS in config.py)")
+        print("  (No --video supplied; using global config.py defaults)")
+        trap = make_speed_trap(args.segment, h, w)
+        roi_polygon = ROI_POLYGONS.get(args.segment) if ROI_POLYGONS else None
+
+    # --- Draw ROI and both gate lines --------------------------------------
+    if roi_polygon:
+        try:
+            from vision.utils import draw_roi
+        except ImportError:
+            from utils import draw_roi                                   # type: ignore
+        draw_roi(img, roi_polygon, label="ROI")
+
+    trap.draw(img)
+    print(f"  Gate entry : y={trap.entry.y}px  ({trap.entry.y/h:.0%})")
+    print(f"  Gate exit  : y={trap.exit.y}px   ({trap.exit.y/h:.0%})")
+    print(f"  Distance   : {trap.gate_distance_m:.1f} m")
 
     out = args.output or args.frame.parent / f"{args.frame.stem}_annotated{args.frame.suffix}"
     cv2.imwrite(str(out), img)

@@ -1,93 +1,102 @@
-malta-road-recovery/
+IAPT-ARI2201/
 │
-├── main.py                         # Phase 1 batch entry point — scans data/raw/video/,
-│                                   # runs detect.py on every clip, then extract_metrics.py
+├── Archive/                            # Scrapped YOLO/CV pipeline — reference only
+│   ├── vision/
+│   │   ├── detect.py                   # (legacy) YOLOv8 + ByteTrack single-clip driver
+│   │   ├── virtual_gates.py            # (legacy) VirtualGate / GateCrossing / make_gate
+│   │   ├── utils.py                    # (legacy) ROI + geometry helpers
+│   │   ├── config.py                   # (legacy) CV calibration constants
+│   │   └── video_config.py             # (legacy) per-clip YAML sidecar loader
+│   ├── data/
+│   │   ├── processed/yolo_output/      # (legacy) historical YOLO output location
+│   │   └── video_sidecars/             # (legacy) per-clip calibration YAMLs
+│   └── tests/
+│       └── test_gates.py               # (legacy) Phase 1 CV unit tests
 │
-├── config/
-│   ├── roads.yaml                  # geometry, lane counts, speed limits
-│   ├── simulation.yaml             # SUMO run parameters, time steps
-│   └── ml.yaml                     # hyperparameters, feature names
-│
-├── data/
-│   ├── raw/
-│   │   ├── video/                  # drop 15-min .mp4 clips here (regional_10am.mp4 etc.)
-│   │   └── osm/                    # downloaded .osm files
-│   ├── processed/
-│   │   ├── yolo_output/            # output of detect.py:
-│   │   │                           #   <seg>_<slot>_frames.csv  (frame,id,class,speed_kph,entry_time)
-│   │   │                           #   <seg>_<slot>.csv         (1-min summary bins)
-│   │   └── calibration/            # output of extract_metrics.py:
-│   │                               #   <seg>_<slot>_metrics.csv (flow, density, class ratios)
-│   ├── synthetic/
-│   │   └── simulation_runs/        # one CSV per TraCI run (Phase 2/3)
-│   └── features/
-│       ├── train.csv               # ML feature matrix (Phase 4)
-│       └── test.csv
-│
-├── vision/                         # Phase 1 — computer vision pipeline
-│   ├── __init__.py                 # makes vision/ an importable Python package
-│   ├── config.py                   # *** CALIBRATION FILE — edit this before running ***
-│   │                               #   CALIBRATION: pixels_per_metre per segment
-│   │                               #   ROI_POLYGONS: road-area corner coordinates
-│   │                               #   GATE_Y_RATIOS: counting-line position
-│   │                               #   VEHICLE_CLASSES, SPEED_SMOOTH_FRAMES, etc.
-│   ├── utils.py                    # geometry helpers: build_roi_mask, point_in_polygon,
-│   │                               #   apply_roi_mask, draw_roi, extract_still_frame
-│   ├── virtual_gates.py            # VirtualGate class + GateCrossing dataclass
-│   │                               #   make_gate() factory reads from config.py
-│   │                               #   CLI: python vision/virtual_gates.py --frame still.jpg --segment regional
-│   ├── detect.py                   # run_pipeline() — full single-clip pipeline:
-│   │                               #   YOLOv8 + ByteTrack, ROI masking, speed estimation,
-│   │                               #   gate crossing detection, writes both CSV outputs
-│   │                               #   CLI: python vision/detect.py --video ... --segment ... --slot ...
-│   └── extract_metrics.py          # process_file() — per-frame or summary CSV →
-│                                   #   calibration metrics CSV (flow, density, class ratios)
-│                                   #   CLI: python vision/extract_metrics.py --input ...
-│
-├── simulation/                     # Phase 2 + 3 — SUMO & TraCI
-│   ├── networks/
-│   │   ├── regional_road/          # .net.xml, .poly.xml
-│   │   └── valley_road/
-│   ├── demand/
-│   │   ├── regional_10am.rou.xml
-│   │   ├── regional_1pm.rou.xml
-│   │   ├── regional_5pm.rou.xml
-│   │   ├── valley_10am.rou.xml
-│   │   ├── valley_1pm.rou.xml
-│   │   └── valley_5pm.rou.xml
-│   ├── traci/
-│   │   ├── run_incident.py         # single-run TraCI script
-│   │   ├── batch_runner.py         # loops over experiment matrix
-│   │   ├── matrics_logger.py       # logs speed/flow every second
-│   │   └── congestion_flag.py      # back-pressure detector
-│   └── sumo_configs/
-│       ├── regional.sumocfg
-│       └── valley.sumocfg
-│
-├── ml/                             # Phase 4 — modelling
-│   ├── build_features.py           # raw sim CSVs → features/train.csv
-│   ├── train.py                    # XGBoost + RF + linear baseline
-│   ├── evaluate.py                 # RMSE, feature importance plots
-│   └── models/
-│       ├── predict.py              # inference on new inputs
-│       ├── xgboost_trec.pkl
-│       └── rf_trec.pkl
-│
-├── notebooks/
-│   ├── 01_yolo_exploration.ipynb
-│   ├── 02_sumo_calibration.ipynb
-│   ├── 03_synthetic_dataset_eda.ipynb
-│   └── 04_ml_results.ipynb
-│
-├── reports/
-│   ├── figures/                    # exported plots for writeup
-│   └── validation_notes.md         # manual observations per road segment
-│
-├── tests/
-│   ├── test_gates.py               # Phase 1 — 20 unit tests (gate crossing, ROI mask, factory)
-│   ├── test_traci_loop.py          # Phase 2/3 — TraCI loop tests
-│   └── test_features.py            # Phase 4 — feature engineering tests
-│
-├── requirements.txt                # pip install -r requirements.txt
 ├── README.md
-└── .gitignore
+├── file_structure.txt
+├── requirements.txt
+│
+└── malta-road-recovery/
+    │
+    ├── main.py                         # *** ACTIVE PHASE 1 DRIVER ***
+    │                                   # Walks every CSV in every direction folder
+    │                                   # then runs extract_metrics on each aggregate
+    │
+    ├── config/
+    │   ├── roads.yaml                  # geometry, lane counts, speed limits
+    │   ├── simulation.yaml             # SUMO run parameters, time steps
+    │   └── ml.yaml                     # hyperparameters, feature names
+    │
+    ├── data/
+    │   ├── raw/
+    │   │   ├── manual_counts/          # *** PHASE 1 INPUT ***
+    │   │   │   ├── regional_north/<slot>.csv
+    │   │   │   ├── regional_south/<slot>.csv
+    │   │   │   ├── valley_east/<slot>.csv
+    │   │   │   ├── valley_west/<slot>.csv
+    │   │   │   └── README.md           # row-level schema + naming convention
+    │   │   ├── video/                  # raw 10-minute .mp4 clips (for human observer)
+    │   │   └── osm/                    # downloaded .osm files
+    │   ├── processed/
+    │   │   ├── aggregated/             # output of manual_to_sumo.py (per direction):
+    │   │   │   ├── regional_north/<slot>.csv
+    │   │   │   ├── regional_south/<slot>.csv
+    │   │   │   ├── valley_east/<slot>.csv
+    │   │   │   └── valley_west/<slot>.csv
+    │   │   └── calibration/            # output of extract_metrics.py:
+    │   │                               #   <direction>_<slot>_metrics.csv
+    │   ├── synthetic/
+    │   │   └── simulation_runs/        # one CSV per TraCI run (Phase 2/3)
+    │   └── features/
+    │       ├── train.csv               # ML feature matrix (Phase 4)
+    │       └── test.csv
+    │
+    ├── data_processing/                # Phase 1 — manual-entry pipeline
+    │   ├── __init__.py
+    │   ├── manual_to_sumo.py           # Manual CSV → aggregated bins → SUMO
+    │   │                               #   .rou.xml (vType + route) + .flow.xml (per bin)
+    │   │                               #   CLI: --input <csv>  |  --all
+    │   └── extract_metrics.py          # Aggregated CSV → calibration metrics CSV
+    │                                   #   (flow, density, ratios, incident flag)
+    │                                   #   CLI: --input <csv>  |  --all
+    │
+    ├── simulation/                     # Phase 2 + 3 — SUMO & TraCI
+    │   ├── networks/
+    │   │   ├── regional_road/          # .net.xml, .poly.xml
+    │   │   └── valley_road/
+    │   ├── demand/                     # *** GENERATED by manual_to_sumo.py ***
+    │   │   ├── regional_north_<slot>.rou.xml    regional_north_<slot>.flow.xml
+    │   │   ├── regional_south_<slot>.rou.xml    regional_south_<slot>.flow.xml
+    │   │   ├── valley_east_<slot>.rou.xml       valley_east_<slot>.flow.xml
+    │   │   └── valley_west_<slot>.rou.xml       valley_west_<slot>.flow.xml
+    │   ├── traci/
+    │   │   ├── run_incident.py         # single-run TraCI script
+    │   │   ├── batch_runner.py         # loops over experiment matrix
+    │   │   ├── matrics_logger.py       # logs speed/flow every second
+    │   │   └── congestion_flag.py      # back-pressure detector
+    │   └── sumo_configs/
+    │       ├── regional.sumocfg
+    │       └── valley.sumocfg
+    │
+    ├── ml/                             # Phase 4 — modelling
+    │   ├── build_features.py           # raw sim CSVs → features/train.csv
+    │   ├── train.py                    # XGBoost + RF + linear baseline
+    │   ├── evaluate.py                 # RMSE, feature importance plots
+    │   └── models/
+    │       ├── predict.py
+    │       ├── xgboost_trec.pkl
+    │       └── rf_trec.pkl
+    │
+    ├── notebooks/
+    │   ├── 02_sumo_calibration.ipynb
+    │   ├── 03_synthetic_dataset_eda.ipynb
+    │   └── 04_ml_results.ipynb
+    │
+    ├── reports/
+    │   ├── figures/                    # exported plots for writeup
+    │   └── validation_notes.md         # manual observations per direction
+    │
+    └── tests/
+        ├── test_traci_loop.py          # Phase 2/3 — TraCI loop tests
+        └── test_features.py            # Phase 4 — feature engineering tests

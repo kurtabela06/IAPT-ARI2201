@@ -1,0 +1,6 @@
+direction,slot,timestamp_bin,car_count,heavy_vehicle_count,avg_speed_kph,incident_status,timestamp_s,vehicle_count,flow_rate_veh_hr,density_veh_km,incident_flag
+valley_west,10am,0,5,1,39.5,clear,0,6,360,9.1139,0
+valley_west,10am,1,6,0,40.2,clear,60,6,360,8.9552,0
+valley_west,10am,2,7,1,37.8,clear,120,8,480,12.6984,0
+valley_west,10am,3,4,0,22.6,slow,180,4,240,10.6195,1
+valley_west,10am,4,5,1,36.1,clear,240,6,360,9.9723,0

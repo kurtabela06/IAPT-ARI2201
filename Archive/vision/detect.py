@@ -1,6 +1,17 @@
 """
 vision/detect.py
 ================
+⚠️  LEGACY — NO LONGER PART OF THE ACTIVE PIPELINE  ⚠️
+
+Phase 1 was pivoted to manual ground-truth extraction because of perspective
+and tracking inconsistencies in the YOLO + ByteTrack output. This file is
+retained only as reference for the CV approach that was attempted. The
+active entry point is `main.py`, which drives
+`data_processing/manual_to_sumo.py` against CSVs in
+`data/raw/manual_counts/`.
+
+Original module docstring follows.
+
 Phase 1 detection & tracking pipeline for a single video clip.
 
 Produces TWO output files per clip:
@@ -71,17 +82,14 @@ from vision.config import (          # noqa: E402
     SPEED_SMOOTH_FRAMES,
     CONFIDENCE_THRESHOLD,
     BIN_SECONDS,
-    ROI_POLYGONS,
-    GATE_Y_RATIOS,
     PER_FRAME_COLUMNS,
     PER_VEHICLE_COLUMNS,
     INFERENCE_DEVICE,
     INFERENCE_IMGSZ,
     FRAME_STRIDE,
     TEST_DURATION_S,
-    scaling_factor_x,
-    CALIBRATION_VIEWS,
 )
+from vision.video_config import load_video_calibration, describe as describe_calib  # noqa: E402
 
 # Test-mode preview window size (width, height) — keeps the 1080×1920 frame
 # at a readable size on screen while we draw ROI/Gate on the native frame.
@@ -338,13 +346,10 @@ def run_pipeline(
             f"Expected one of: {list(CALIBRATION.keys())}"
         )
 
-    calib     = CALIBRATION[segment]
-    raw_ppm   = calib["pixels_per_metre"]
-    # PPM is measured on this segment's own calibration view; scale to native 1080px width.
-    seg_scale_x = scaling_factor_x(segment)
-    ppm         = raw_ppm * seg_scale_x
-    n_lanes     = calib["lanes"]
-    view_w, _   = CALIBRATION_VIEWS[segment]
+    # --- Load per-video calibration (sidecar .yaml or global config.py) ----
+    vc = load_video_calibration(video_path, segment)
+    ppm     = vc.pixels_per_metre
+    n_lanes = vc.lanes
 
     print(f"\n{'='*60}")
     print(f"  Malta Road Recovery — Phase 1 Vision Pipeline")
@@ -352,8 +357,7 @@ def run_pipeline(
     print(f"  Segment  : {segment.upper()}  ({n_lanes}-lane road)")
     print(f"  Slot     : {slot}")
     print(f"  Video    : {video_path.name}")
-    print(f"  PPM      : {raw_ppm} px/m (measured @{view_w}px) "
-          f"→ {ppm:.2f} px/m (native 1080px, x{seg_scale_x:.3f})")
+    describe_calib(vc)
     if test_mode:
         print(f"  Mode     : TEST — first {TEST_DURATION_S}s only")
     else:
@@ -401,26 +405,25 @@ def run_pipeline(
     roi_polygon = None
     roi_mask    = None
 
-    if use_roi and ROI_POLYGONS is not None and segment in ROI_POLYGONS:
-        roi_polygon = ROI_POLYGONS[segment]
+    if use_roi and vc.roi_polygon is not None:
+        roi_polygon = vc.roi_polygon
         roi_mask    = build_roi_mask((frame_h, frame_w), roi_polygon)
-        print(f"  ROI : {len(roi_polygon)}-point polygon active  "
-              f"(edit coordinates in vision/config.py)")
+        src = vc.source
+        print(f"  ROI : {len(roi_polygon)}-point polygon active  [{src}]")
     else:
         print("  ROI : DISABLED")
 
     # --- Build dual-gate speed trap ---------------------------------------
-    trap = make_speed_trap(segment, frame_h, frame_w)
-    # Honour the --gate override by shifting the entry line only; the exit
-    # line stays at its configured position.
-    if gate_ratio is not None:
-        trap.entry = VirtualGate(
-            y_position  = int(frame_h * gate_ratio),
-            frame_width = frame_w,
-            label       = f"{segment} — gate_entry",
-            colour      = trap.entry.colour,
-            roi_polygon = roi_polygon,
-        )
+    # Sidecar / global values are applied via keyword overrides;
+    # --gate CLI flag further overrides the entry line if supplied.
+    entry_ratio = gate_ratio if gate_ratio is not None else vc.gate_entry_ratio
+    trap = make_speed_trap(
+        segment, frame_h, frame_w,
+        gate_entry_ratio = entry_ratio,
+        gate_exit_ratio  = vc.gate_exit_ratio,
+        gate_distance_m  = vc.gate_distance_m,
+        roi_polygon      = roi_polygon,
+    )
 
     print(f"  Gate entry : {trap.entry.y}px  ({trap.entry.y/frame_h:.0%})   "
           f"Gate exit : {trap.exit.y}px  ({trap.exit.y/frame_h:.0%})")
