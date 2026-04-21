@@ -269,3 +269,17 @@ BIN_SECONDS = 60   # 1-minute bins for the summary CSV
 # ---------------------------------------------------------------------------
 # Per-frame CSV columns (produced by detect.py)
 PER_FRAME_COLUMNS = ["frame", "id", "class", "speed_kph", "entry_time"]
+
+# Per-vehicle CSV columns — one row per tracked vehicle for easy reading
+PER_VEHICLE_COLUMNS = [
+    "id",
+    "class",
+    "entry_time_s",
+    "exit_time_s",
+    "duration_s",
+    "gate_speed_kph",
+    "avg_speed_kph",
+    "max_speed_kph",
+    "frames_seen",
+    "direction",
+]

@@ -74,6 +74,7 @@ from vision.config import (          # noqa: E402
     ROI_POLYGONS,
     GATE_Y_RATIOS,
     PER_FRAME_COLUMNS,
+    PER_VEHICLE_COLUMNS,
     INFERENCE_DEVICE,
     INFERENCE_IMGSZ,
     FRAME_STRIDE,
@@ -192,6 +193,20 @@ class BinAggregator:
         self._counts[class_name] += 1
         if speed_kph is not None and speed_kph > 0:
             self._speeds.append(speed_kph)
+
+    def touch(self, ts: float) -> None:
+        """Ensure at least one bin exists for the observed time range.
+
+        Called when we see the video advance past a bin boundary with no
+        vehicle counts.  Prevents an empty summary CSV when a short clip
+        has no gate crossings.
+        """
+        idx = self._bin_index(ts)
+        if self._current_bin < 0:
+            self._current_bin = idx
+        elif idx != self._current_bin:
+            self._flush(self._current_bin)
+            self._current_bin = idx
 
     def _flush(self, bin_idx: int) -> None:
         ts    = bin_idx * self.bin_seconds
@@ -429,6 +444,11 @@ def run_pipeline(
     per_frame_rows: list[dict] = []
     entry_logged:   set[int]   = set()
 
+    # Per-vehicle state — one entry per unique track ID.
+    # Populated on first sight; gate_speed_kph / exit_time filled in when the
+    # SpeedTrap fires.  Flushed to a CSV at the end of the run.
+    vehicles: dict[int, dict] = {}
+
     frame_idx     = 0   # absolute frame counter
     processed     = 0   # frames actually sent to YOLO
 
@@ -492,12 +512,38 @@ def run_pipeline(
 
                 speed = estimator.update(track_id, cx, cy)
 
-                # Buffer per-frame row (speed filled in when the trap fires)
+                # Per-vehicle bookkeeping — counts every car once, whether
+                # or not it ever crosses both gates.
+                veh = vehicles.get(track_id)
+                if veh is None:
+                    veh = {
+                        "id":             track_id,
+                        "class":          class_name,
+                        "entry_time_s":   round(timestamp_s, 3),
+                        "exit_time_s":    None,
+                        "gate_speed_kph": None,
+                        "speed_samples":  [],
+                        "frames_seen":    0,
+                        "direction":      "",
+                    }
+                    vehicles[track_id] = veh
+                    aggregator.add(timestamp_s, class_name, speed)
+                else:
+                    aggregator.touch(timestamp_s)
+
+                veh["frames_seen"] += 1
+                if speed is not None and speed > 0:
+                    veh["speed_samples"].append(float(speed))
+
+                # Populate speed_kph on EVERY per-frame row with the smoothed
+                # per-frame estimate.  The gate-trap speed overrides this on
+                # the frame it fires (below).
+                row_speed = "" if speed is None else round(float(speed), 2)
                 per_frame_rows.append({
                     "frame":      frame_idx,
                     "id":         track_id,
                     "class":      class_name,
-                    "speed_kph":  "",
+                    "speed_kph":  row_speed,
                     "entry_time": round(timestamp_s, 3),
                 })
 
@@ -514,11 +560,15 @@ def run_pipeline(
 
                 if trap_event is not None:
                     trap_speed = trap_event.speed_kph  # None if no entry seen
-                    # Stamp the trap speed onto this frame's row for the CSV
-                    per_frame_rows[-1]["speed_kph"] = (
-                        trap_speed if trap_speed is not None else ""
-                    )
-                    aggregator.add(timestamp_s, class_name, trap_speed)
+                    # Stamp the (more accurate) trap speed onto this frame's row.
+                    if trap_speed is not None:
+                        per_frame_rows[-1]["speed_kph"] = trap_speed
+                    veh["exit_time_s"]    = round(trap_event.exit_time_s, 3)
+                    veh["gate_speed_kph"] = trap_speed
+                    veh["direction"]      = trap_event.direction
+                    if trap_event.entry_time_s is not None:
+                        veh["entry_time_s"] = round(trap_event.entry_time_s, 3)
+
                     if track_id not in entry_logged:
                         entry_logged.add(track_id)
                         speed_str = (
@@ -584,6 +634,38 @@ def run_pipeline(
 
     print(f"\n  Per-frame CSV : {frames_path}")
     print(f"  {len(df_frames)} rows  |  {df_frames['id'].nunique()} unique track IDs")
+
+    # --- Write per-vehicle CSV (1 row per detected car) -------------------
+    vehicle_rows: list[dict] = []
+    for veh in vehicles.values():
+        samples = veh["speed_samples"]
+        avg_spd = round(float(np.mean(samples)), 2) if samples else ""
+        max_spd = round(float(np.max(samples)),  2) if samples else ""
+        exit_t  = veh["exit_time_s"]
+        duration = (
+            round(exit_t - veh["entry_time_s"], 3)
+            if exit_t is not None else ""
+        )
+        vehicle_rows.append({
+            "id":              veh["id"],
+            "class":           veh["class"],
+            "entry_time_s":    veh["entry_time_s"],
+            "exit_time_s":     exit_t if exit_t is not None else "",
+            "duration_s":      duration,
+            "gate_speed_kph":  veh["gate_speed_kph"] if veh["gate_speed_kph"] is not None else "",
+            "avg_speed_kph":   avg_spd,
+            "max_speed_kph":   max_spd,
+            "frames_seen":     veh["frames_seen"],
+            "direction":       veh["direction"],
+        })
+
+    vehicles_path = OUTPUT_DIR / f"{segment}_{slot}_vehicles.csv"
+    df_vehicles   = pd.DataFrame(vehicle_rows, columns=PER_VEHICLE_COLUMNS)
+    df_vehicles   = df_vehicles.sort_values("entry_time_s", kind="stable")
+    df_vehicles.to_csv(vehicles_path, index=False)
+    print(f"  Vehicles CSV  : {vehicles_path}")
+    print(f"  {len(df_vehicles)} unique vehicle(s)  "
+          f"|  {int((df_vehicles['gate_speed_kph'] != '').sum())} with gate speed")
 
     # --- Write summary CSV (one write at the end) --------------------------
     summary_path = OUTPUT_DIR / f"{segment}_{slot}.csv"
