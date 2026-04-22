@@ -15,9 +15,16 @@ CSV schema  (one row per 1-minute bin — already aggregated by the observer):
 
     timestamp_bin        int or label — the 1-minute bin index (0, 1, 2, …)
     car_count            int          — cars that crossed the counting line in the bin
+    motorcycle_count     int          — motorcycles in the bin (defaults to 0 if column absent)
     heavy_vehicle_count  int          — buses + trucks combined in the bin
-    avg_speed_kph        float        — mean speed observed for the bin
+    avg_car_speed_kph    float        — mean car speed observed for the bin
     incident_status      str          — one of: clear | slow | blocked | incident
+
+PCE weights (Passenger Car Equivalents) are applied when computing
+effective road occupancy:
+    CAR_PCE        = 1.0
+    MOTORCYCLE_PCE = 0.5
+    HEAVY_PCE      = 2.5
 
 Outputs (per <direction>/<slot>.csv):
 
@@ -69,19 +76,28 @@ REQUIRED_COLUMNS = (
     "timestamp_bin",
     "car_count",
     "heavy_vehicle_count",
-    "avg_speed_kph",
+    "avg_car_speed_kph",
     "incident_status",
 )
+# motorcycle_count is optional — absent column silently defaults to 0.
 
 VALID_INCIDENT_STATUSES = {"clear", "slow", "blocked", "incident"}
+
+# Passenger Car Equivalents — used to compute effective road occupancy.
+CAR_PCE        = 1.0
+MOTORCYCLE_PCE = 0.5
+HEAVY_PCE      = 2.5
 
 # SUMO vType defaults feed the generated .rou.xml so the simulation runs
 # against the manual demand without a separate type file.
 SUMO_VTYPES: dict[str, dict[str, str]] = {
-    "car":   {"vClass": "passenger", "accel": "2.6", "decel": "4.5", "sigma": "0.5",
-              "length": "4.5",  "maxSpeed": "36.11", "guiShape": "passenger"},
-    "heavy": {"vClass": "truck",     "accel": "1.3", "decel": "4.0", "sigma": "0.5",
-              "length": "9.0",  "maxSpeed": "25.00", "guiShape": "truck"},
+    "car":        {"vClass": "passenger",   "accel": "2.6", "decel": "4.5", "sigma": "0.5",
+                   "length": "4.5",  "maxSpeed": "36.11", "guiShape": "passenger"},
+    "motorcycle": {"vClass": "motorcycle",  "accel": "4.0", "decel": "6.0", "sigma": "0.5",
+                   "length": "2.2",  "maxSpeed": "36.11", "guiShape": "motorcycle",
+                   "width": "0.8"},
+    "heavy":      {"vClass": "truck",       "accel": "1.3", "decel": "4.0", "sigma": "0.5",
+                   "length": "9.0",  "maxSpeed": "25.00", "guiShape": "truck"},
 }
 
 BIN_SECONDS = 60
@@ -98,6 +114,9 @@ def validate_and_enrich(df: pd.DataFrame, *, direction: str, slot: str) -> pd.Da
     """
     Validate the manual CSV columns and enrich it with calibration-ready
     derived columns. Returns a sorted DataFrame with one row per 1-minute bin.
+
+    motorcycle_count is optional — the column is created and defaulted to 0
+    if absent, so older CSVs without it continue to work without changes.
     """
     missing = set(REQUIRED_COLUMNS) - set(df.columns)
     if missing:
@@ -106,12 +125,17 @@ def validate_and_enrich(df: pd.DataFrame, *, direction: str, slot: str) -> pd.Da
             f"{sorted(missing)}.  Expected: {list(REQUIRED_COLUMNS)}"
         )
 
-    df = df[list(REQUIRED_COLUMNS)].copy()
+    # Pull only the columns we care about; inject motorcycle_count if absent.
+    keep = list(REQUIRED_COLUMNS) + ["motorcycle_count"]
+    df = df[[c for c in keep if c in df.columns]].copy()
+    if "motorcycle_count" not in df.columns:
+        df["motorcycle_count"] = 0
 
     df["timestamp_bin"]       = pd.to_numeric(df["timestamp_bin"],       errors="coerce").astype("Int64")
     df["car_count"]           = pd.to_numeric(df["car_count"],           errors="coerce").fillna(0).astype(int)
+    df["motorcycle_count"]    = pd.to_numeric(df["motorcycle_count"],    errors="coerce").fillna(0).astype(int)
     df["heavy_vehicle_count"] = pd.to_numeric(df["heavy_vehicle_count"], errors="coerce").fillna(0).astype(int)
-    df["avg_speed_kph"]       = pd.to_numeric(df["avg_speed_kph"],       errors="coerce")
+    df["avg_car_speed_kph"]   = pd.to_numeric(df["avg_car_speed_kph"],   errors="coerce")
     df["incident_status"]     = df["incident_status"].astype(str).str.strip().str.lower()
 
     bad_bins = df[df["timestamp_bin"].isna()]
@@ -133,15 +157,33 @@ def validate_and_enrich(df: pd.DataFrame, *, direction: str, slot: str) -> pd.Da
     df.insert(0, "direction", direction)
     df.insert(1, "slot",      slot)
 
-    df["timestamp_s"]      = df["timestamp_bin"].astype(int) * BIN_SECONDS
-    df["vehicle_count"]    = df["car_count"] + df["heavy_vehicle_count"]
+    df["timestamp_s"]   = df["timestamp_bin"].astype(int) * BIN_SECONDS
+    df["vehicle_count"] = df["car_count"] + df["motorcycle_count"] + df["heavy_vehicle_count"]
+
+    # Effective Road Occupancy in Passenger Car Equivalents
+    df["pce_total"] = (
+        df["car_count"]           * CAR_PCE
+        + df["motorcycle_count"]  * MOTORCYCLE_PCE
+        + df["heavy_vehicle_count"] * HEAVY_PCE
+    ).round(2)
+
     df["flow_rate_veh_hr"] = df["vehicle_count"] * (3600 // BIN_SECONDS)
-    df["density_veh_km"]   = np.where(
-        df["avg_speed_kph"] > 0,
-        df["flow_rate_veh_hr"] / df["avg_speed_kph"],
+    df["flow_rate_pce_hr"] = df["pce_total"]     * (3600 // BIN_SECONDS)
+
+    df["density_veh_km"] = np.where(
+        df["avg_car_speed_kph"] > 0,
+        df["flow_rate_veh_hr"] / df["avg_car_speed_kph"],
         np.nan,
     ).round(4)
-    df["incident_flag"]    = (df["incident_status"] != "clear").astype(int)
+
+    # PCE-weighted density gives a more accurate road-load figure for SUMO.
+    df["density_pce_km"] = np.where(
+        df["avg_car_speed_kph"] > 0,
+        df["flow_rate_pce_hr"] / df["avg_car_speed_kph"],
+        np.nan,
+    ).round(4)
+
+    df["incident_flag"] = (df["incident_status"] != "clear").astype(int)
 
     return df
 
@@ -207,10 +249,14 @@ def write_flow_xml(
         if int(row["vehicle_count"]) == 0:
             continue
 
-        speed_kph    = float(row["avg_speed_kph"]) if pd.notna(row["avg_speed_kph"]) and row["avg_speed_kph"] > 0 else FALLBACK_SPEED_KPH
+        speed_kph    = float(row["avg_car_speed_kph"]) if pd.notna(row["avg_car_speed_kph"]) and row["avg_car_speed_kph"] > 0 else FALLBACK_SPEED_KPH
         depart_speed = f"{speed_kph / 3.6:.2f}"
 
-        for cls, count_col in (("car", "car_count"), ("heavy", "heavy_vehicle_count")):
+        for cls, count_col in (
+            ("car",        "car_count"),
+            ("motorcycle", "motorcycle_count"),
+            ("heavy",      "heavy_vehicle_count"),
+        ):
             cls_count = int(row[count_col])
             if cls_count == 0:
                 continue
@@ -277,14 +323,15 @@ def process_manual_file(
     write_rou_xml (df_bins, rou_out,  edge_from, edge_to)
     write_flow_xml(df_bins, flow_out, edge_from, edge_to)
 
-    mean_speed = float(df_bins["avg_speed_kph"].replace(0, np.nan).mean(skipna=True) or 0)
+    mean_speed = float(df_bins["avg_car_speed_kph"].replace(0, np.nan).mean(skipna=True) or 0)
     print(f"\n[manual] {direction} / {slot}")
     print("─" * 56)
-    print(f"  Bins                  : {len(df_bins)}")
-    print(f"  Total vehicles        : {int(df_bins['vehicle_count'].sum())}")
-    print(f"  Cars / heavy          : {int(df_bins['car_count'].sum())} / {int(df_bins['heavy_vehicle_count'].sum())}")
-    print(f"  Mean bin speed (kph)  : {round(mean_speed, 2)}")
-    print(f"  Bins flagged incident : {int(df_bins['incident_flag'].sum())}")
+    print(f"  Bins                       : {len(df_bins)}")
+    print(f"  Total vehicles             : {int(df_bins['vehicle_count'].sum())}")
+    print(f"  Cars / motorcycles / heavy : {int(df_bins['car_count'].sum())} / {int(df_bins['motorcycle_count'].sum())} / {int(df_bins['heavy_vehicle_count'].sum())}")
+    print(f"  Total PCE                  : {round(float(df_bins['pce_total'].sum()), 1)}")
+    print(f"  Mean bin speed (kph)       : {round(mean_speed, 2)}")
+    print(f"  Bins flagged incident      : {int(df_bins['incident_flag'].sum())}")
     print(f"  Aggregated CSV  → {aggregated_out}")
     print(f"  SUMO .rou.xml   → {rou_out}")
     print(f"  SUMO .flow.xml  → {flow_out}")

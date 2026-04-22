@@ -88,11 +88,6 @@ IAPT-ARI2201/
     │       ├── xgboost_trec.pkl
     │       └── rf_trec.pkl
     │
-    ├── notebooks/
-    │   ├── 02_sumo_calibration.ipynb
-    │   ├── 03_synthetic_dataset_eda.ipynb
-    │   └── 04_ml_results.ipynb
-    │
     ├── reports/
     │   ├── figures/                    # exported plots for writeup
     │   └── validation_notes.md         # manual observations per direction

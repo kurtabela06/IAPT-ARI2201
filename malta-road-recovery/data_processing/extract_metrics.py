@@ -33,9 +33,9 @@ DIRECTIONS = ("regional_north", "regional_south", "valley_east", "valley_west")
 
 REQUIRED_COLUMNS = (
     "direction", "slot", "timestamp_bin", "timestamp_s",
-    "car_count", "heavy_vehicle_count", "vehicle_count",
-    "avg_speed_kph", "flow_rate_veh_hr", "density_veh_km",
-    "incident_status", "incident_flag",
+    "car_count", "motorcycle_count", "heavy_vehicle_count", "vehicle_count",
+    "pce_total", "avg_car_speed_kph", "flow_rate_veh_hr", "flow_rate_pce_hr",
+    "density_veh_km", "density_pce_km", "incident_status", "incident_flag",
 )
 
 
@@ -65,9 +65,10 @@ def extract_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     total = df["vehicle_count"].replace(0, np.nan)
-    df["ratio_heavy"] = (df["heavy_vehicle_count"] / total).fillna(0).round(4)
-    df["ratio_car"]   = (df["car_count"]           / total).fillna(0).round(4)
-    df = df.rename(columns={"avg_speed_kph": "time_mean_speed_kph"})
+    df["ratio_car"]        = (df["car_count"]           / total).fillna(0).round(4)
+    df["ratio_motorcycle"] = (df["motorcycle_count"]    / total).fillna(0).round(4)
+    df["ratio_heavy"]      = (df["heavy_vehicle_count"] / total).fillna(0).round(4)
+    df = df.rename(columns={"avg_car_speed_kph": "time_mean_speed_kph"})
     return df
 
 
@@ -78,11 +79,15 @@ def summary_stats(df: pd.DataFrame) -> dict:
         "total_bins":            len(df),
         "total_vehicles":        int(df["vehicle_count"].sum()),
         "total_cars":            int(df["car_count"].sum()),
+        "total_motorcycles":     int(df["motorcycle_count"].sum()),
         "total_heavy":           int(df["heavy_vehicle_count"].sum()),
+        "total_pce":             round(float(df["pce_total"].sum()), 1),
         "peak_flow_veh_hr":      int(df["flow_rate_veh_hr"].max()),
+        "peak_flow_pce_hr":      round(float(df["flow_rate_pce_hr"].max()), 1),
         "mean_flow_veh_hr":      round(float(df["flow_rate_veh_hr"].mean()), 1),
         "space_mean_speed_kph":  round(harmonic_mean(df["time_mean_speed_kph"]), 2),
         "mean_density_veh_km":   round(float(df["density_veh_km"].mean(skipna=True)), 3),
+        "mean_density_pce_km":   round(float(df["density_pce_km"].mean(skipna=True)), 3),
         "incident_bins":         int(df["incident_flag"].sum()),
     }
 

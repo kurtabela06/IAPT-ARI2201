@@ -1,6 +1,0 @@
-direction,slot,timestamp_bin,car_count,heavy_vehicle_count,time_mean_speed_kph,incident_status,timestamp_s,vehicle_count,flow_rate_veh_hr,density_veh_km,incident_flag,ratio_heavy,ratio_car
-valley_east,10am,0,6,0,41.0,clear,0,6,360,8.7805,0,0.0,1.0
-valley_east,10am,1,5,1,38.2,clear,60,6,360,9.4241,0,0.1667,0.8333
-valley_east,10am,2,4,0,20.5,slow,120,4,240,11.7073,1,0.0,1.0
-valley_east,10am,3,2,0,0.0,blocked,180,2,120,,1,0.0,1.0
-valley_east,10am,4,5,1,35.4,incident,240,6,360,10.1695,1,0.1667,0.8333

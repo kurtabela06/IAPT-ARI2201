@@ -1,6 +1,11 @@
-timestamp_bin,car_count,heavy_vehicle_count,avg_speed_kph,incident_status
-0,14,2,54.2,clear
-1,12,1,52.7,clear
-2,10,3,48.3,clear
-3,9,2,42.1,slow
-4,11,2,50.6,clear
+timestamp_bin,car_count,motorcycle_count,heavy_vehicle_count,avg_car_speed_kph,incident_status
+0,30,3,5,60,clear
+1,26,0,4,60,clear
+2,34,2,3,60,clear
+3,40,1,4,60,clear
+4,20,3,5,60,clear
+5,32,1,2,60,clear
+6,32,1,3,60,clear
+7,31,0,4,60,clear
+8,23,1,1,60,clear
+9,29,1,2,60,clear

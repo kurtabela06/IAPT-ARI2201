@@ -1,6 +1,0 @@
-direction,slot,timestamp_bin,car_count,heavy_vehicle_count,time_mean_speed_kph,incident_status,timestamp_s,vehicle_count,flow_rate_veh_hr,density_veh_km,incident_flag,ratio_heavy,ratio_car
-regional_north,10am,0,14,2,54.2,clear,0,16,960,17.7122,0,0.125,0.875
-regional_north,10am,1,12,1,52.7,clear,60,13,780,14.8008,0,0.0769,0.9231
-regional_north,10am,2,10,3,48.3,clear,120,13,780,16.1491,0,0.2308,0.7692
-regional_north,10am,3,9,2,42.1,slow,180,11,660,15.677,1,0.1818,0.8182
-regional_north,10am,4,11,2,50.6,clear,240,13,780,15.415,0,0.1538,0.8462
