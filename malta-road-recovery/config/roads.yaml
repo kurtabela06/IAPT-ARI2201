@@ -1,0 +1,261 @@
+# =============================================================================
+# config/roads.yaml
+# =============================================================================
+# Single source-of-truth for road-segment geometry, OSM identifiers, and the
+# netconvert parameters needed to build each SUMO network.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  PHASE 2 QUICK-START                                                     │
+# │                                                                          │
+# │  Each segment declares a `topology:` describing how the road behaves:    │
+# │                                                                          │
+# │    topology.type = simple        — one route per direction (Valley Road) │
+# │    topology.type = merge_split   — two inflows merge into a 3-lane trunk │
+# │                                    that then splits into two outflows    │
+# │                                    (Triq Regionali, both directions)     │
+# │                                                                          │
+# │  For merge_split topologies you describe FIVE physical edges + TWO       │
+# │  junction nodes (the merge node and the split node). build_network.py    │
+# │  emits a .nod.xml + .edg.xml + .con.xml that netconvert reads to build   │
+# │  the network deterministically — the OSM extract is only used for        │
+# │  geometry and surrounding context.                                       │
+# │                                                                          │
+# │  Workflow:                                                               │
+# │    1. Find each Way in https://www.openstreetmap.org and copy its ID     │
+# │    2. Paste the ID into the matching `way_id:` slot below                │
+# │    3. Replace any 999xxxxxxx placeholders with the real Way IDs          │
+# │    4. Run:                                                               │
+# │         python simulation/run_sumo.py --build                            │
+# │         python simulation/run_sumo.py --preview --segment regional_road  │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# REQUIRED OSM TAGS (verified on each way before running netconvert):
+#   highway   maxspeed   lanes   oneway   name   junction(if any)
+#
+# PLACEHOLDER IDs
+# ---------------
+# IDs at or above 999000000 are placeholders. The scripts warn loudly on
+# every run until you replace them with real OSM way IDs. The rest of the
+# pipeline still runs against the real IDs that are present.
+# =============================================================================
+
+segments:
+
+  # ===========================================================================
+  # REGIONAL ROAD — Triq Regionali, dual carriageway, Malta
+  # ===========================================================================
+  # Both directions share the same merge-then-split topology, mirrored:
+  #
+  #   NORTHBOUND
+  #   ──────────
+  #     [Tunnel inflow,  2 lanes]──┐
+  #                                 ├──[Trunk, 3 lanes]──┬──[Flyover,   2 lanes]
+  #     [Side inflow,    1 lane ]──┘                     └──[Underpass, 1 lane ]
+  #                                ↑                     ↑
+  #                          Priority merge          Diverge / split
+  #                          (merge_node_N)          (split_node_N)
+  #
+  #   SOUTHBOUND  (mirror of NB — inflows and outflows swap)
+  #   ──────────
+  #     [Flyover,   2 lanes]──┐
+  #                            ├──[Trunk, 3 lanes]──┬──[Tunnel,   2 lanes]
+  #     [Underpass, 1 lane ]──┘                     └──[Escape,   1 lane ]
+  #                            ↑                    ↑
+  #                      Priority merge        Diverge / split
+  #                      (merge_node_S)        (split_node_S)
+  # ---------------------------------------------------------------------------
+  regional_road:
+    display_name: "Triq Regionali — Dual Carriageway"
+
+    # Bounding box for the OSM extract (must encompass every Way listed below).
+    bbox:
+      south: 35.8870
+      west:  14.4490
+      north: 35.8950
+      east:  14.4620
+
+    # Network-level defaults inherited by edges that do not override them.
+    speed_limit_kph: 80
+    lane_width_m:    3.65
+    highway_class:   primary
+
+    # Demand split between inflow_a and inflow_b on the merge side.
+    # outflow_main (the wider road) receives this share of vehicles at the
+    # split; outflow_div receives (1 - share). Tune to match observed counts.
+    merge_split_demand:
+      outflow_main_share: 0.70      # 70 % stay on the main carriageway
+      # The same ratio also governs the inflow demand split — i.e. inflow_a
+      # (the wider inflow) feeds 70 % of the manual count and inflow_b feeds
+      # the remaining 30 %, so the trunk total matches the CSV.
+      inflow_a_share:     0.70
+
+    # ── DIRECTIONS ────────────────────────────────────────────────────────────
+    directions:
+
+      regional_north:
+        topology:
+          type: merge_split
+
+          # Merge side — two inflows feed into the trunk.
+          inflow_a:                       # the WIDER inflow
+            label:    tunnel_n
+            way_id:   26556191           # ← PLACEHOLDER (Tunnel inflow, NB)
+            lanes:    2
+          inflow_b:                       # the NARROWER inflow
+            label:    inflow_n
+            way_id:   29980849           # ← PLACEHOLDER (1-lane side inflow, NB)
+            lanes:    1
+
+          # Trunk — three lanes carrying both inflows after the merge.
+          trunk:
+            label:    trunk_n
+            way_id:   517103373            # filmed section (real OSM ID)
+            lanes:    3
+
+          # Split side — trunk diverges into the wider outflow_main and the
+          # narrower outflow_div.
+          outflow_main:                   # the WIDER outflow
+            label:    flyover_n
+            way_id:   156818223           # 2-lane continuation (real OSM ID)
+            lanes:    2
+          outflow_div:                    # the NARROWER outflow
+            label:    underpass_n
+            way_id:   517103363           # ← PLACEHOLDER (1-lane Underpass, NB)
+            lanes:    1
+
+          # Junction nodes — netconvert receives these as Priority Junctions
+          # so the trunk has right-of-way over the side inflow at the merge,
+          # and the split is realised as a normal diverge from the trunk.
+          merge_node:  merge_node_N
+          split_node:  split_node_N
+          # Boundary nodes (ends of the inflow / outflow stubs) — used so
+          # vehicles depart and arrive at the network edge rather than mid-way.
+          inflow_a_node:  in_a_N
+          inflow_b_node:  in_b_N
+          out_main_node:  out_main_N
+          out_div_node:   out_div_N
+
+        # Incident control acts on the trunk (3-lane filmed section).
+        incident_edge: trunk_n
+
+      regional_south:
+        topology:
+          type: merge_split
+
+          inflow_a:                       # the WIDER inflow
+            label:    flyover_s
+            way_id:   156971084           # ← PLACEHOLDER (2-lane Flyover, SB)
+            lanes:    2
+          inflow_b:                       # the NARROWER inflow
+            label:    underpass_s
+            way_id:   517103361           # ← PLACEHOLDER (1-lane Underpass, SB)
+            lanes:    1
+
+          trunk:
+            label:    trunk_s
+            way_id:   517103377            # same physical road as NB trunk
+            lanes:    3
+
+          outflow_main:                   # the WIDER outflow
+            label:    tunnel_s
+            way_id:   29980851           # 2-lane continuation (real OSM ID)
+            lanes:    2
+          outflow_div:                    # the NARROWER outflow
+            label:    escape_s
+            way_id:   156973246           # ← PLACEHOLDER (1-lane Escape, SB)
+            lanes:    1
+
+          merge_node:    merge_node_S
+          split_node:    split_node_S
+          inflow_a_node: in_a_S
+          inflow_b_node: in_b_S
+          out_main_node: out_main_S
+          out_div_node:  out_div_S
+
+        incident_edge: trunk_s
+
+    # ── BACKGROUND MERGE FRICTION ───────────────────────────────────────────
+    # Optional: extra side-roads that feed the trunk/inflows with a constant
+    # background flow. Keep here for slip-roads we did NOT count manually.
+    merge_ways: []
+
+    # ── INCIDENT RESPONSE ───────────────────────────────────────────────────
+    incident_lane_closure_default: 0
+    speed_reduction_kph:
+      slow:     50
+      blocked:   5
+      incident: 30
+
+
+  # ===========================================================================
+  # VALLEY ROAD — single carriageway, rural, Malta
+  # ===========================================================================
+  # No merging or diverging — one OSM way per direction. Uses topology.type
+  # = "simple" which keeps the legacy single-edge route format.
+  # ---------------------------------------------------------------------------
+  valley_road:
+    display_name: "Valley Road — Single Carriageway"
+
+    bbox:
+      south: 35.8620
+      west:  14.3780
+      north: 35.8720
+      east:  14.4000
+
+    speed_limit_kph: 60
+    lane_width_m:    3.0
+    highway_class:   secondary
+
+    directions:
+
+      valley_east:
+        topology:
+          type: simple
+          mainline:
+            label:  valley_east
+            way_id: 30094711
+            lanes:  1
+          from_node: valley_west_boundary
+          to_node:   valley_east_boundary
+        incident_edge: valley_east
+
+      valley_west:
+        topology:
+          type: simple
+          mainline:
+            label:  valley_west
+            way_id: 30094711
+            lanes:  1
+          from_node: valley_east_boundary
+          to_node:   valley_west_boundary
+        incident_edge: valley_west
+
+    merge_ways: []
+
+    incident_lane_closure_default: 0
+    speed_reduction_kph:
+      slow:     30
+      blocked:   5
+      incident: 20
+
+
+# =============================================================================
+# REQUIRED OSM METADATA TAGS — checklist for manual OSM verification
+# =============================================================================
+#
+# Tag              Why it matters for SUMO
+# ---------------  -------------------------------------------------------
+# highway          netconvert uses this to set default speed, priority,
+#                  and lane count when explicit tags are absent.
+# lanes            Directly maps to SUMO edge numLanes. Without it,
+#                  netconvert defaults to 1 lane.
+# lanes:forward    Needed for divided roads without a physical separator.
+# lanes:backward   As above.
+# maxspeed         Sets SUMO edge speed attribute.
+# oneway           Controls whether netconvert creates one or two edges.
+# junction         "roundabout" triggers correct SUMO right-of-way logic.
+# turn:lanes       Used by netconvert to set per-lane allowed movements.
+# width            Used in GUI display and some lateral-movement models.
+# name             Appears in SUMO GUI for human reference.
+#
+# =============================================================================

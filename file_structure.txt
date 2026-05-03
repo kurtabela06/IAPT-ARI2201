@@ -20,13 +20,15 @@ IAPT-ARI2201/
 └── malta-road-recovery/
     │
     ├── main.py                         # *** ACTIVE PHASE 1 DRIVER ***
-    │                                   # Walks every CSV in every direction folder
-    │                                   # then runs extract_metrics on each aggregate
+    │                                   # Walks every manual count CSV and writes
+    │                                   # aggregated bins, SUMO demand, and metrics.
     │
     ├── config/
-    │   ├── roads.yaml                  # geometry, lane counts, speed limits
+    │   ├── roads.yaml                  # geometry, lane counts, speed limits, OSM way IDs
     │   ├── simulation.yaml             # SUMO run parameters, time steps
     │   └── ml.yaml                     # hyperparameters, feature names
+
+├── requirements.txt                  # active runtime dependencies + optional SUMO/test comments
     │
     ├── data/
     │   ├── raw/

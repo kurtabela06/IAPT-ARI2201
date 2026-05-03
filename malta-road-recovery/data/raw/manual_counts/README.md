@@ -47,6 +47,30 @@ PCE weights applied automatically by the pipeline:
 - Motorcycle = 0.5 PCE
 - Heavy vehicle = 2.5 PCE
 
+## What the counts represent (Triq Regionali, merge_split topology)
+
+For `regional_north` and `regional_south` the filmed section is the **3-lane
+trunk** in the middle of a merge-then-split structure (see the diagram at
+the top of `config/roads.yaml` and the project README). The counts you
+record represent the **total flow across the trunk** — every vehicle passing
+the camera, regardless of whether it came from the Flyover or the Underpass
+and regardless of whether it leaves via the Tunnel/Flyover or the
+Escape/Underpass.
+
+`manual_to_sumo.py` automatically splits each bin's count across the four
+plausible routes (wider inflow / narrower inflow × wider outflow / narrower
+outflow) using the shares in `merge_split_demand:` (defaults 70 % wider
+inflow, 70 % wider outflow). The sum of the four split counts equals the
+original CSV count exactly, so trunk totals are preserved.
+
+You do **not** need to count Flyover and Underpass separately. If you have
+time-of-day evidence (e.g. "at 5 pm 80 % uses the Flyover"), edit
+`inflow_a_share` / `outflow_main_share` in `roads.yaml` rather than
+splitting the counts in the CSV.
+
+Valley Road (`valley_east` / `valley_west`) is single-lane and uses the
+`simple` topology — the count goes directly to the one and only route.
+
 ## Example
 
 ```csv

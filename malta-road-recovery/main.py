@@ -51,10 +51,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-metrics", action="store_true",
                    help="Skip the extract_metrics step "
                         "(just produces aggregated bins + SUMO demand)")
-    p.add_argument("--edge-from", default=None,
-                   help="SUMO source edge ID (default: <direction>_in)")
-    p.add_argument("--edge-to", default=None,
-                   help="SUMO destination edge ID (default: <direction>_out)")
     return p
 
 
@@ -86,7 +82,7 @@ def main() -> None:
     for p in targets:
         try:
             direction, slot = _parse_direction_and_slot(p)
-            outputs = process_manual_file(p, edge_from=args.edge_from, edge_to=args.edge_to)
+            outputs = process_manual_file(p)
             result = {
                 "direction":      direction,
                 "slot":           slot,
