@@ -1,0 +1,13 @@
+{
+  "network": "VEB",
+  "direction": "valley_east",
+  "slot": "10am",
+  "variant": "1_lane_closed",
+  "exit_total": 13,
+  "escape_total": 104,
+  "total_delay_veh_s": 1366.45,
+  "scaling_applied": 1.0,
+  "manual_slot": "10am",
+  "calibration_scl": 0.9688,
+  "injection_count": 117
+}

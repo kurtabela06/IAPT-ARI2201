@@ -1,0 +1,287 @@
+"""
+simulation/networks.py
+======================
+Hardcoded NetworkX road skeletons for the Malta Road Recovery study.
+
+We model four directed road networks as networkx.DiGraph objects:
+
+    RNB   Regional Road Northbound
+    RSB   Regional Road Southbound
+    VEB   Valley Road Eastbound
+    VWB   Valley Road Westbound
+
+Every edge carries three structural attributes:
+
+    length_m        — physical length of the road segment in metres
+    lanes           — number of through lanes
+    max_occupancy_m — length_m × lanes  (the spatial-density denominator
+                      used by the Greenshields engine)
+
+Plus a free-flow speed (`v_free_mps`) inherited from the segment's posted
+limit, and an `is_escape` flag identifying diverge edges that traffic spills
+to under congestion (Q3 dynamic diversion).
+
+The four DiGraphs are returned by `build_all_networks()`.
+Geometry numbers come from the user-supplied spec — they are intentionally
+embedded here as Python literals (Q2 = b) so the road model is read in one
+file with no YAML round-trip.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import networkx as nx
+
+# ---------------------------------------------------------------------------
+# Free-flow speeds (km/h → m/s) per segment.
+# ---------------------------------------------------------------------------
+# Regional: posted 80 km/h. Valley: posted 60 km/h. Naxxar slip 50 km/h.
+KPH_TO_MPS = 1.0 / 3.6
+V_FREE_REGIONAL_MPS = 80.0 * KPH_TO_MPS    # ≈ 22.22 m/s
+V_FREE_VALLEY_MPS   = 60.0 * KPH_TO_MPS    # ≈ 16.67 m/s
+V_FREE_NAXXAR_MPS   = 50.0 * KPH_TO_MPS    # ≈ 13.89 m/s
+
+
+# ---------------------------------------------------------------------------
+# Edge metadata helper
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EdgeSpec:
+    src:       str
+    dst:       str
+    label:     str
+    length_m:  float
+    lanes:     int
+    v_free:    float
+    is_escape: bool = False
+    is_inflow: bool = False     # demand-injection edge
+    is_exit:   bool = False     # measurement edge for calibration / recovery
+    role:      str = ""         # human-readable role tag (flyover, trunk, …)
+
+
+def _add_edges(g: nx.DiGraph, specs: list[EdgeSpec]) -> None:
+    for s in specs:
+        g.add_edge(
+            s.src, s.dst,
+            label           = s.label,
+            length_m        = s.length_m,
+            lanes           = s.lanes,
+            max_occupancy_m = s.length_m * s.lanes,
+            v_free_mps      = s.v_free,
+            is_escape       = s.is_escape,
+            is_inflow       = s.is_inflow,
+            is_exit         = s.is_exit,
+            role            = s.role,
+        )
+
+
+# ---------------------------------------------------------------------------
+# A. Regional Road Southbound (RSB)
+# ---------------------------------------------------------------------------
+# Geometry (Start → End):
+#
+#   [Flyover Entry,   2L, 140 m]──┐
+#                                  ├──[Main Mergeway, 3L, 235 m]──┐
+#   [Underpass Entry, 1L, 140 m]──┘                                │
+#                                                                  ▼
+#                                            ┌──[Escape Exit, 1L, 175 m] ── (escape sink)
+#                                            │  diverges at start of Main Way
+#   ────────────[Main Way, 2L, 175 m]────────┴──► (south sink)
+#
+# Key node IDs:
+#   src_flyover_S, src_underpass_S    — inflow boundaries
+#   merge_S                           — flyover + underpass meet
+#   diverge_S                         — start of the Main Way / Escape split
+#   sink_main_S, sink_escape_S        — exit boundaries
+
+def build_rsb() -> nx.DiGraph:
+    g = nx.DiGraph(name="RSB", display_name="Regional Road Southbound")
+    specs = [
+        EdgeSpec("src_flyover_S",   "merge_S",
+                 "flyover_S",   140.0, 2, V_FREE_REGIONAL_MPS,
+                 is_inflow=True, role="flyover"),
+        EdgeSpec("src_underpass_S", "merge_S",
+                 "underpass_S", 140.0, 1, V_FREE_REGIONAL_MPS,
+                 is_inflow=True, role="underpass"),
+        EdgeSpec("merge_S",         "diverge_S",
+                 "mergeway_S",  235.0, 3, V_FREE_REGIONAL_MPS,
+                 role="trunk"),
+        EdgeSpec("diverge_S",       "sink_main_S",
+                 "mainway_S",   175.0, 2, V_FREE_REGIONAL_MPS,
+                 is_exit=True, role="main_way"),
+        EdgeSpec("diverge_S",       "sink_escape_S",
+                 "escape_S",    175.0, 1, V_FREE_REGIONAL_MPS,
+                 is_escape=True, role="escape"),
+    ]
+    _add_edges(g, specs)
+    g.graph["inflow_edges"]   = ["flyover_S", "underpass_S"]
+    g.graph["exit_edges"]     = ["mainway_S"]
+    g.graph["escape_edges"]   = ["escape_S"]
+    g.graph["closeable_edge"] = "mergeway_S"   # the edge whose lanes get closed
+    return g
+
+
+# ---------------------------------------------------------------------------
+# B. Regional Road Northbound (RNB)
+# ---------------------------------------------------------------------------
+# Geometry (Start → End):
+#
+#   ─[Main Merge Way, 3L, 140 m]──merge_join_N──[Main Merge Way (cont), 3L, 120 m]──diverge_N──┬──[Final Main Way, 2L, 465 m]──► (north sink)
+#                                  ▲                                                          │
+#                                  │                                                          └──[Escape Way, 1L, 465 m]──► (escape sink)
+#                                  │
+#                          [Underpass Entry 1, 1L, 250 m]
+#                                  ▲
+#                                  │
+#                              src_underpass_N
+#
+# Node IDs:
+#   src_main_N           — inflow start (before the first 140 m segment)
+#   merge_join_N         — where Underpass Entry 1 joins the trunk
+#   diverge_N            — split point
+#   sink_final_N         — Final Main Way exit
+#   sink_escape_N        — Escape Way exit
+#   src_underpass_N      — Underpass Entry 1 inflow
+
+def build_rnb() -> nx.DiGraph:
+    g = nx.DiGraph(name="RNB", display_name="Regional Road Northbound")
+    specs = [
+        EdgeSpec("src_main_N",       "merge_join_N",
+                 "mergeway_N_a", 140.0, 3, V_FREE_REGIONAL_MPS,
+                 is_inflow=True, role="trunk_pre"),
+        EdgeSpec("src_underpass_N",  "merge_join_N",
+                 "underpass_N",  250.0, 1, V_FREE_REGIONAL_MPS,
+                 is_inflow=True, role="underpass"),
+        EdgeSpec("merge_join_N",     "diverge_N",
+                 "mergeway_N_b", 120.0, 3, V_FREE_REGIONAL_MPS,
+                 role="trunk_post"),
+        EdgeSpec("diverge_N",        "sink_final_N",
+                 "mainway_N",    465.0, 2, V_FREE_REGIONAL_MPS,
+                 is_exit=True, role="main_way"),
+        EdgeSpec("diverge_N",        "sink_escape_N",
+                 "escape_N",     465.0, 1, V_FREE_REGIONAL_MPS,
+                 is_escape=True, role="escape"),
+    ]
+    _add_edges(g, specs)
+    g.graph["inflow_edges"]   = ["mergeway_N_a", "underpass_N"]
+    g.graph["exit_edges"]     = ["mainway_N"]
+    g.graph["escape_edges"]   = ["escape_N"]
+    g.graph["closeable_edge"] = "mergeway_N_b"
+    return g
+
+
+# ---------------------------------------------------------------------------
+# C. Valley Road Eastbound (VEB)
+# ---------------------------------------------------------------------------
+# Geometry:
+#
+#   src_valley_E ──[Valley Road, 1L, 180 m]── branch_E ──[Valley Cont., 1L, 350 m]── sink_main_E
+#                                              │
+#                                              └─[Naxxar Road, 1L, 400 m]── sink_naxxar_E   (escape)
+#
+# The Naxxar Road branch is the dynamic-diversion target ("Pressure-Valve"):
+# when the Valley Continuation queues up, a fraction of vehicles spill onto
+# Naxxar Road. Same mechanism as the regional escape edges.
+
+def build_veb() -> nx.DiGraph:
+    g = nx.DiGraph(name="VEB", display_name="Valley Road Eastbound")
+    specs = [
+        EdgeSpec("src_valley_E",  "branch_E",
+                 "valley_E",        180.0, 1, V_FREE_VALLEY_MPS,
+                 is_inflow=True, role="valley_pre"),
+        EdgeSpec("branch_E",      "sink_main_E",
+                 "valley_cont_E",   350.0, 1, V_FREE_VALLEY_MPS,
+                 is_exit=True, role="valley_continuation"),
+        EdgeSpec("branch_E",      "sink_naxxar_E",
+                 "naxxar_E",        400.0, 1, V_FREE_NAXXAR_MPS,
+                 is_escape=True, role="naxxar_diversion"),
+    ]
+    _add_edges(g, specs)
+    g.graph["inflow_edges"]   = ["valley_E"]
+    g.graph["exit_edges"]     = ["valley_cont_E"]
+    g.graph["escape_edges"]   = ["naxxar_E"]
+    g.graph["closeable_edge"] = "valley_cont_E"
+    return g
+
+
+# ---------------------------------------------------------------------------
+# D. Valley Road Westbound (VWB)
+# ---------------------------------------------------------------------------
+# Geometry: Valley Road = 1000 m total in the westbound direction.
+#
+# Inflows:
+#   Psaila Street (200 m)                 ──┐
+#                                            ├── Fleur-de-lys Entry (135 m) ── joins Valley Road
+#   Fleur-de-lys (200 m, single branch)   ──┘                                  130 m before the network end
+#
+#   src_psaila_W ─[psaila_W, 1L, 200 m]─┐
+#                                        │
+#                         (Psaila joins Fleur-de-lys *between* the 200 m and 135 m segments)
+#                                        ▼
+#   src_fleur_a ─[fleur_a_W, 1L, 200 m]─ junction_fleur_W ─[fleur_b_W, 1L, 135 m]─ junction_valley_W
+#
+#   src_valley_W ─[valley_W_pre, 1L, 870 m]─ junction_valley_W ─[valley_W_post, 1L, 130 m]─ sink_W
+#
+# Total Valley Road in this direction: 870 + 130 = 1000 m (matches spec).
+
+def build_vwb() -> nx.DiGraph:
+    g = nx.DiGraph(name="VWB", display_name="Valley Road Westbound")
+    specs = [
+        # Main Valley Road: cut into pre-/post-junction so Fleur-de-lys can
+        # join exactly 130 m before the network end.
+        EdgeSpec("src_valley_W",       "junction_valley_W",
+                 "valley_W_pre",   870.0, 1, V_FREE_VALLEY_MPS,
+                 is_inflow=True, role="valley_main_pre"),
+        EdgeSpec("junction_valley_W",  "sink_W",
+                 "valley_W_post",  130.0, 1, V_FREE_VALLEY_MPS,
+                 is_exit=True, role="valley_main_post"),
+
+        # Fleur-de-lys branch: 200 m + 135 m, with Psaila joining at the seam.
+        EdgeSpec("src_fleur_a",        "junction_fleur_W",
+                 "fleur_a_W",      200.0, 1, V_FREE_VALLEY_MPS,
+                 is_inflow=True, role="fleur_de_lys_a"),
+        EdgeSpec("src_psaila_W",       "junction_fleur_W",
+                 "psaila_W",       200.0, 1, V_FREE_VALLEY_MPS,
+                 is_inflow=True, role="psaila_street"),
+        EdgeSpec("junction_fleur_W",   "junction_valley_W",
+                 "fleur_b_W",      135.0, 1, V_FREE_VALLEY_MPS,
+                 role="fleur_de_lys_b"),
+    ]
+    _add_edges(g, specs)
+    g.graph["inflow_edges"]   = ["valley_W_pre", "fleur_a_W", "psaila_W"]
+    g.graph["exit_edges"]     = ["valley_W_post"]
+    g.graph["escape_edges"]   = []   # no escape route in this direction
+    g.graph["closeable_edge"] = "valley_W_post"
+    return g
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+NETWORK_BUILDERS = {
+    "RNB": build_rnb,
+    "RSB": build_rsb,
+    "VEB": build_veb,
+    "VWB": build_vwb,
+}
+
+# Map manual-CSV direction names → DiGraph keys
+DIRECTION_TO_NETWORK = {
+    "regional_north": "RNB",
+    "regional_south": "RSB",
+    "valley_east":    "VEB",
+    "valley_west":    "VWB",
+}
+
+
+def build_network(key: str) -> nx.DiGraph:
+    if key not in NETWORK_BUILDERS:
+        raise KeyError(f"Unknown network '{key}'. Available: {list(NETWORK_BUILDERS)}")
+    return NETWORK_BUILDERS[key]()
+
+
+def build_all_networks() -> dict[str, nx.DiGraph]:
+    return {k: f() for k, f in NETWORK_BUILDERS.items()}

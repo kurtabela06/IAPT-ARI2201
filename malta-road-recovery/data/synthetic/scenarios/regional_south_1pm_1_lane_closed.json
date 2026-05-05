@@ -1,0 +1,13 @@
+{
+  "network": "RSB",
+  "direction": "regional_south",
+  "slot": "1pm",
+  "variant": "1_lane_closed",
+  "exit_total": 398,
+  "escape_total": 0,
+  "total_delay_veh_s": 9327.58,
+  "scaling_applied": 1.0,
+  "manual_slot": "1pm",
+  "calibration_scl": 1.0156,
+  "injection_count": 398
+}

@@ -1,0 +1,11 @@
+timestamp_bin,car,hgv,motorcycle,incident_status,observed_speed_kph
+0,40,4,3,clear,40
+1,20,0,5,clear,60
+2,32,3,1,clear,60
+3,37,2,4,slow,30
+4,35,4,5,clear,50
+5,24,4,3,slow,30
+6,42,4,4,clear,50
+7,28,2,5,clear,50
+8,28,2,4,clear,60
+9,28,3,2,clear,60

@@ -1,0 +1,10 @@
+{
+  "direction": "regional_north",
+  "slot": "1pm",
+  "manual_total": 406,
+  "scaling": 1.0156,
+  "injected_total": 411,
+  "simulated_exit": 411,
+  "iterations": 5,
+  "match_pct": 1.232
+}

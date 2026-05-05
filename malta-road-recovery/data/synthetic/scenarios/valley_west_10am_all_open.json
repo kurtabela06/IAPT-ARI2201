@@ -1,0 +1,13 @@
+{
+  "network": "VWB",
+  "direction": "valley_west",
+  "slot": "10am",
+  "variant": "all_open",
+  "exit_total": 116,
+  "escape_total": 0,
+  "total_delay_veh_s": 741.05,
+  "scaling_applied": 1.0,
+  "manual_slot": "10am",
+  "calibration_scl": 1.1094,
+  "injection_count": 124
+}

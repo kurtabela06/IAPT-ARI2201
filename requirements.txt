@@ -5,14 +5,12 @@
 numpy>=1.26.0
 pandas>=2.2.0
 PyYAML>=6.0.1               # config file parsing
-requests>=2.31.0            # OSM download for simulation/build_network.py
-tqdm>=4.66.0                # progress bars in batch scripts
 
-# Optional / SUMO-related dependencies. SUMO itself is installed separately.
-# sumolib>=1.19.0
-# traci>=1.19.0
+# Phase 2 — custom NetworkX engine + Matplotlib visualisation
+networkx>=3.2
+matplotlib>=3.8.0
 
-# Optional / archive CV pipeline (legacy tools, not required for Phase 1 manual counts)
+# Optional / archive CV pipeline (legacy tools, not required for the active pipeline)
 # ultralytics>=8.2.0
 # opencv-python-headless>=4.9.0
 # scipy>=1.12.0

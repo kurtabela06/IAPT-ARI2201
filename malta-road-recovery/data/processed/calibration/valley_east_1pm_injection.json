@@ -1,0 +1,10 @@
+{
+  "direction": "valley_east",
+  "slot": "1pm",
+  "manual_total": 123,
+  "scaling": 0.9688,
+  "injected_total": 123,
+  "simulated_exit": 123,
+  "iterations": 4,
+  "match_pct": 0.0
+}

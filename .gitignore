@@ -4,3 +4,9 @@ malta-road-recovery/data/raw/video/*.mp4
 
 # Ignore Mac system files
 .DS_Store
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

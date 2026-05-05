@@ -1,0 +1,13 @@
+{
+  "network": "RSB",
+  "direction": "regional_south",
+  "slot": "10am",
+  "variant": "all_open",
+  "exit_total": 328,
+  "escape_total": 0,
+  "total_delay_veh_s": 5090.28,
+  "scaling_applied": 1.0,
+  "manual_slot": "10am",
+  "calibration_scl": 1.0156,
+  "injection_count": 328
+}

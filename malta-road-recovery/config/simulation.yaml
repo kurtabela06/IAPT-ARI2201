@@ -1,0 +1,54 @@
+# =============================================================================
+# config/simulation.yaml
+# =============================================================================
+# Parameters for the custom NetworkX-based traffic engine. SUMO is gone.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Vehicle physics
+# ---------------------------------------------------------------------------
+# Lengths in metres. Motorcycles do not contribute to spatial occupancy and
+# always travel at v_free (queue-filtering specification).
+vehicles:
+  car:
+    length_m: 5.0
+    contributes_to_occupancy: true
+  hgv:
+    length_m: 8.0
+    contributes_to_occupancy: true
+  motorcycle:
+    length_m: 0.5
+    contributes_to_occupancy: false
+
+# ---------------------------------------------------------------------------
+# Greenshields parameters
+# ---------------------------------------------------------------------------
+greenshields:
+  jam_ratio_cap:  1.0      # ρ/ρ_jam at which v collapses to min_speed_mps
+  min_speed_mps:  0.5      # creep speed on a saturated edge
+
+# ---------------------------------------------------------------------------
+# Engine timing
+# ---------------------------------------------------------------------------
+engine:
+  step_s:           1
+  horizon_s:        600
+  bin_seconds:      60
+  closure_start_s:  60
+
+# ---------------------------------------------------------------------------
+# Dynamic diversion (queue spill)
+# ---------------------------------------------------------------------------
+diversion:
+  saturation_threshold: 0.80
+  weight_growth_k:      8.0
+  max_divert_share:     0.40
+
+# ---------------------------------------------------------------------------
+# Calibration (Q4 — injection-count tuner)
+# ---------------------------------------------------------------------------
+calibration:
+  match_tolerance_pct: 2.0
+  max_iterations:      40
+  search_low_factor:   0.50
+  search_high_factor:  2.00
