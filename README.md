@@ -97,7 +97,7 @@ Each direction is a separate `networkx.DiGraph` with hardcoded geometry
 | **RNB** | Regional Road Northbound             | mergeway_N_a (3L 140m) + underpass_N (1L 250m) → mergeway_N_b (3L 120m) → diverge → mainway_N (2L 465m) / escape_N (1L 465m) |
 | **RSB** | Regional Road Southbound             | flyover_S (2L 140m) + underpass_S (1L 140m) → mergeway_S (3L 235m) → diverge → mainway_S (2L 175m) / escape_S (1L 175m) |
 | **VEB** | Valley Road Eastbound                | valley_E (1L 180m) → branch → valley_cont_E (1L 350m) / **naxxar_E (1L 400m)** ← Pressure-Valve diversion |
-| **VWB** | Valley Road Westbound                | valley_W_pre (1L 870m) and (psaila_W + fleur_a_W → fleur_b_W) → junction → valley_W_post (1L 130m) |
+| **VWB** | Valley Road Westbound                | valley_W_pre (1L 370m) and (psaila_W + fleur_a_W → fleur_b_W) → junction → valley_W_post (1L 130m) — main stretch 500 m total |
 
 Every edge stores: `length_m`, `lanes`, `max_occupancy_m = length_m × lanes`,
 and `v_free_mps` (from posted speed limit).
@@ -123,6 +123,7 @@ Configurable via `config/simulation.yaml`:
 | `engine.closure_start_s`                    | 60         |
 | `engine.cell_length_m`                      | 100.0      |
 | `engine.per_lane_acceptance_per_s`          | 0.6        |
+| `closure.partial_throughput_factor`         | 0.5        |
 | `backpressure.downstream_threshold`         | 0.90       |
 | `diversion.baseline_share`                  | 0.07       |
 | `diversion.saturation_threshold`            | 0.80       |
@@ -219,6 +220,24 @@ Per network:
 | VEB | `valley_cont_E` | 1 → 0     |
 | VWB | `valley_W_post` | 1 → 0 (no escape route exists) |
 
+### Bottleneck Penalty (2-lane partial closure)
+
+When a 2-lane edge has 1 lane closed (`effective_lanes < original_lanes`
+but `> 0`), the engine applies an explicit per-second acceptance cap on
+that edge's first cell:
+
+```
+partial_cap_per_s = original_lanes × per_lane_acceptance_per_s × partial_throughput_factor
+                  = 2 × 0.6 × 0.5 = 0.6 veh/s   (default)
+```
+
+This is the spec's "fixed throughput rate of 50 % of the original
+capacity." The `partial_throughput_factor` knob lives at
+`closure.partial_throughput_factor` in `simulation/simulation.yaml`.
+Combined with the diversion curve, ~50 % of arrivals at the diverge node
+are pushed to the escape route once Main Way saturates, while the
+remaining ~50 % trickle through the half-cap Main Way at v_free.
+
 ### Dynamic diversion (Pressure-Valve, three-stage curve)
 
 The diversion share at each diverge node is a piecewise function of the
@@ -303,6 +322,30 @@ so each direction has a stable, topology-faithful node arrangement that
 will line up cleanly when real-world top-down images are added in Phase 3.
 Every edge and every particle is rendered concurrently in each 1-second
 frame, so split points (diverges) and merges are visible in real time.
+
+**Edge naming for academic clarity**: every edge carries a `display_name`
+attribute used by the visualizer label. Trunks are labelled "Regional Road"
+or "Valley Road"; inflows are "Entry 1", "Entry 2"… numbered in flow order;
+outflows are "Exit 1", "Exit 2"… same convention. Internal IDs (`mainway_N`,
+`flyover_S`, etc.) remain unchanged in the engine and telemetry CSVs so
+existing downstream code stays compatible.
+
+**Telemetry banner** at the top of the figure shows scenario name (e.g.
+`RSB • 5:00 PM • 1 Lane Closed`), current sim time (`t = 300 s / 600 s`),
+and a vehicle-weighted **network-mean speed** (km/h) recomputed every frame.
+
+**Line-style rules** per spec:
+
+| Edge state | Line style |
+| --- | --- |
+| Open / partially closed (any lanes ≥ 1) | Solid |
+| Fully closed (effective_lanes = 0) | Dashed black |
+
+Partially-closed edges also display a `½cap` tag next to their label so
+you can see at a glance which edges are the bottleneck.
+
+**Sectioned legend** on the right side: OCCUPANCY (colour scale) / LANE
+STATE (line styles) / VEHICLE CLASS (dot colours) / NOTES.
 
 | Range          | Edge colour |
 | -------------- | ----------- |

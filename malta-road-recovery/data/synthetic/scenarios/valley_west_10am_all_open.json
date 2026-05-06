@@ -6,10 +6,10 @@
   "exit_total": 114,
   "escape_total": 0,
   "queued_at_entry": 0,
-  "still_in_network": 10,
-  "total_delay_veh_s": 2569.36,
+  "still_in_network": 0,
+  "total_delay_veh_s": 1056.0,
   "scaling_applied": 1.0,
   "manual_slot": "10am",
-  "calibration_scl": 1.1094,
-  "injection_count": 124
+  "calibration_scl": 0.9688,
+  "injection_count": 114
 }

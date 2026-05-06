@@ -104,6 +104,14 @@ _DEFAULT_CFG = {
         "weight_growth_k":        8.0,
     },
     "backpressure": {"downstream_threshold": 0.90},
+    "closure": {
+        # Bottleneck Penalty for partially-closed multi-lane edges.
+        # When `effective_lanes < original_lanes` and `effective_lanes > 0`,
+        # the closeable edge's first-cell acceptance is capped at
+        #     original_lanes * per_lane_acceptance_per_s * partial_throughput_factor
+        # i.e. 50 % of the *original* free-flow throughput by default.
+        "partial_throughput_factor": 0.5,
+    },
 }
 
 
@@ -158,6 +166,11 @@ class _EngineState:
     edge_rows:     list[dict]                  = field(default_factory=list)
     cell_rows:     list[dict]                  = field(default_factory=list)
     effective_lanes: dict[str, int]            = field(default_factory=dict)
+    original_lanes:  dict[str, int]            = field(default_factory=dict)
+    # Per-second acceptance cap for the *first cell* of an edge whose lanes
+    # are partially closed. Set when a "Bottleneck Penalty" applies; None
+    # otherwise. Reset each tick by the engine main loop.
+    partial_cap_per_s: dict[str, Optional[float]] = field(default_factory=dict)
     # Source queue per inflow edge — vehicles waiting to enter when cell 0
     # is already saturated. Each item is a Particle (count + class).
     source_queue: dict[str, list[Particle]]    = field(default_factory=dict)
@@ -174,6 +187,8 @@ def _init_state(g: nx.DiGraph, cfg: dict) -> _EngineState:
         st.cum_delay[lbl] = 0.0
         st.exit_counts[lbl] = {c: 0 for c in VEHICLE_CLASSES}
         st.effective_lanes[lbl] = d["lanes"]
+        st.original_lanes[lbl]  = d["lanes"]
+        st.partial_cap_per_s[lbl] = None
         st.source_queue[lbl] = []
     return st
 
@@ -461,6 +476,9 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
         "full_closure":   None,
     }.get(scenario.variant, 0)
 
+    closure_cfg = cfg.get("closure", _DEFAULT_CFG["closure"])
+    partial_factor = closure_cfg.get("partial_throughput_factor", 0.5)
+
     for t in range(horizon + 1):
         # ── 1. Apply closure if scheduled ──────────────────────────────
         if t == closure_start and closeable:
@@ -469,6 +487,18 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
                 state.effective_lanes[closeable] = 0
             else:
                 state.effective_lanes[closeable] = max(cd["lanes"] - closure_lane_drop, 0)
+            # Bottleneck Penalty (item 1): when a multi-lane edge is partially
+            # closed, cap its first-cell acceptance at partial_factor × the
+            # original free-flow throughput. effective_lanes==0 has separate
+            # closed-edge handling so it doesn't go through this branch.
+            eff = state.effective_lanes[closeable]
+            orig = state.original_lanes.get(closeable, cd["lanes"])
+            if 0 < eff < orig:
+                state.partial_cap_per_s[closeable] = (
+                    orig * per_lane_acc * partial_factor
+                )
+            else:
+                state.partial_cap_per_s[closeable] = None
 
         # ── 2. Inject demand pulse, smeared across the minute ──────────
         bin_idx = t // bin_secs
@@ -811,6 +841,12 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
     cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
     available_m = max(cell_max_m - cell_used, 0.0)
 
+    # Bottleneck Penalty: partial-closure cap per second on this edge's
+    # first cell. When set, accepted vehicle-equivalent throughput in this
+    # second is bounded by `partial_cap_per_s`.
+    partial_cap = state.partial_cap_per_s.get(target_edge)
+    accepted_this_sec = 0  # count of contributing vehicles accepted
+
     for p, src_lbl, src_ci in arrivals:
         veh_cfg = cfg["vehicles"].get(p.cls, {})
         len_per = veh_cfg.get("length_m", 0.0)
@@ -822,17 +858,39 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
             )
             continue
 
-        if cell_ratio < bp_threshold:
+        # Compute the per-second cap headroom (None ⇒ uncapped).
+        if partial_cap is not None:
+            budget_remaining = max(int(partial_cap) - accepted_this_sec, 0)
+        else:
+            budget_remaining = None
+
+        if cell_ratio < bp_threshold and (budget_remaining is None or budget_remaining > 0):
+            # Free transfer below threshold, possibly limited by partial cap.
+            if budget_remaining is None:
+                accept_n = p.count
+            else:
+                accept_n = min(p.count, budget_remaining)
             state.cells[target_edge][0].append(
-                Particle(cls=p.cls, count=p.count, pos_m=0.0)
+                Particle(cls=p.cls, count=accept_n, pos_m=0.0)
             )
-            cell_used += p.count * len_per
+            cell_used += accept_n * len_per
             available_m = max(cell_max_m - cell_used, 0.0)
             cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+            accepted_this_sec += accept_n
+            rejected = p.count - accept_n
+            if rejected > 0:
+                src_cell_len = state.cell_len[src_lbl]
+                state.cells[src_lbl][src_ci].append(
+                    Particle(cls=p.cls, count=rejected, pos_m=src_cell_len)
+                )
+                state.cum_delay[src_lbl] += rejected * 1.0
             continue
 
         max_by_space = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
-        accept_n = max(min(p.count, max_by_space), 0)
+        if budget_remaining is not None:
+            accept_n = max(min(p.count, max_by_space, budget_remaining), 0)
+        else:
+            accept_n = max(min(p.count, max_by_space), 0)
         if accept_n > 0:
             state.cells[target_edge][0].append(
                 Particle(cls=p.cls, count=accept_n, pos_m=0.0)
@@ -840,6 +898,7 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
             cell_used += accept_n * len_per
             available_m = max(cell_max_m - cell_used, 0.0)
             cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+            accepted_this_sec += accept_n
         rejected = p.count - accept_n
         if rejected > 0:
             src_cell_len = state.cell_len[src_lbl]

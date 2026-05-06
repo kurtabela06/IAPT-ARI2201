@@ -49,16 +49,18 @@ V_FREE_NAXXAR_MPS   = 50.0 * KPH_TO_MPS    # ≈ 13.89 m/s
 
 @dataclass
 class EdgeSpec:
-    src:       str
-    dst:       str
-    label:     str
-    length_m:  float
-    lanes:     int
-    v_free:    float
-    is_escape: bool = False
-    is_inflow: bool = False     # demand-injection edge
-    is_exit:   bool = False     # measurement edge for calibration / recovery
-    role:      str = ""         # human-readable role tag (flyover, trunk, …)
+    src:          str
+    dst:          str
+    label:        str       # internal ID (used by the engine and telemetry)
+    length_m:     float
+    lanes:        int
+    v_free:       float
+    is_escape:    bool = False
+    is_inflow:    bool = False     # demand-injection edge
+    is_exit:      bool = False     # measurement edge for calibration / recovery
+    role:         str = ""         # human-readable role tag (flyover, trunk, …)
+    display_name: str = ""         # academic label shown by the visualizer
+                                   # (e.g. "Regional Road", "Entry 1", "Exit 2")
 
 
 def _add_edges(g: nx.DiGraph, specs: list[EdgeSpec]) -> None:
@@ -74,6 +76,7 @@ def _add_edges(g: nx.DiGraph, specs: list[EdgeSpec]) -> None:
             is_inflow       = s.is_inflow,
             is_exit         = s.is_exit,
             role            = s.role,
+            display_name    = s.display_name or s.label,
         )
 
 
@@ -101,19 +104,24 @@ def build_rsb() -> nx.DiGraph:
     specs = [
         EdgeSpec("src_flyover_S",   "merge_S",
                  "flyover_S",   140.0, 2, V_FREE_REGIONAL_MPS,
-                 is_inflow=True, role="flyover"),
+                 is_inflow=True, role="flyover",
+                 display_name="Entry 1 (Flyover)"),
         EdgeSpec("src_underpass_S", "merge_S",
                  "underpass_S", 140.0, 1, V_FREE_REGIONAL_MPS,
-                 is_inflow=True, role="underpass"),
+                 is_inflow=True, role="underpass",
+                 display_name="Entry 2 (Underpass)"),
         EdgeSpec("merge_S",         "diverge_S",
                  "mergeway_S",  235.0, 3, V_FREE_REGIONAL_MPS,
-                 role="trunk"),
+                 role="trunk",
+                 display_name="Regional Road"),
         EdgeSpec("diverge_S",       "sink_main_S",
                  "mainway_S",   175.0, 2, V_FREE_REGIONAL_MPS,
-                 is_exit=True, role="main_way"),
+                 is_exit=True, role="main_way",
+                 display_name="Exit 1 (Tunnel)"),
         EdgeSpec("diverge_S",       "sink_escape_S",
                  "escape_S",    175.0, 1, V_FREE_REGIONAL_MPS,
-                 is_escape=True, role="escape"),
+                 is_escape=True, role="escape",
+                 display_name="Exit 2 (Escape)"),
     ]
     _add_edges(g, specs)
     g.graph["inflow_edges"]   = ["flyover_S", "underpass_S"]
@@ -151,21 +159,27 @@ def build_rsb() -> nx.DiGraph:
 def build_rnb() -> nx.DiGraph:
     g = nx.DiGraph(name="RNB", display_name="Regional Road Northbound")
     specs = [
+        # The 3-lane Main Merge is itself the wider inflow (Entry 1).
         EdgeSpec("src_main_N",       "merge_join_N",
                  "mergeway_N_a", 140.0, 3, V_FREE_REGIONAL_MPS,
-                 is_inflow=True, role="trunk_pre"),
+                 is_inflow=True, role="trunk_pre",
+                 display_name="Entry 1 (Main Merge)"),
         EdgeSpec("src_underpass_N",  "merge_join_N",
                  "underpass_N",  250.0, 1, V_FREE_REGIONAL_MPS,
-                 is_inflow=True, role="underpass"),
+                 is_inflow=True, role="underpass",
+                 display_name="Entry 2 (Underpass)"),
         EdgeSpec("merge_join_N",     "diverge_N",
                  "mergeway_N_b", 120.0, 3, V_FREE_REGIONAL_MPS,
-                 role="trunk_post"),
+                 role="trunk_post",
+                 display_name="Regional Road"),
         EdgeSpec("diverge_N",        "sink_final_N",
                  "mainway_N",    465.0, 2, V_FREE_REGIONAL_MPS,
-                 is_exit=True, role="main_way"),
+                 is_exit=True, role="main_way",
+                 display_name="Exit 1 (Final Main)"),
         EdgeSpec("diverge_N",        "sink_escape_N",
                  "escape_N",     465.0, 1, V_FREE_REGIONAL_MPS,
-                 is_escape=True, role="escape"),
+                 is_escape=True, role="escape",
+                 display_name="Exit 2 (Escape)"),
     ]
     _add_edges(g, specs)
     g.graph["inflow_edges"]   = ["mergeway_N_a", "underpass_N"]
@@ -195,13 +209,16 @@ def build_veb() -> nx.DiGraph:
     specs = [
         EdgeSpec("src_valley_E",  "branch_E",
                  "valley_E",        180.0, 1, V_FREE_VALLEY_MPS,
-                 is_inflow=True, role="valley_pre"),
+                 is_inflow=True, role="valley_pre",
+                 display_name="Valley Road"),
         EdgeSpec("branch_E",      "sink_main_E",
                  "valley_cont_E",   350.0, 1, V_FREE_VALLEY_MPS,
-                 is_exit=True, role="valley_continuation"),
+                 is_exit=True, role="valley_continuation",
+                 display_name="Exit 1 (Valley Continuation)"),
         EdgeSpec("branch_E",      "sink_naxxar_E",
                  "naxxar_E",        400.0, 1, V_FREE_NAXXAR_MPS,
-                 is_escape=True, role="naxxar_diversion"),
+                 is_escape=True, role="naxxar_diversion",
+                 display_name="Exit 2 (Naxxar Road)"),
     ]
     _add_edges(g, specs)
     g.graph["inflow_edges"]   = ["valley_E"]
@@ -227,32 +244,37 @@ def build_veb() -> nx.DiGraph:
 #                                        ▼
 #   src_fleur_a ─[fleur_a_W, 1L, 200 m]─ junction_fleur_W ─[fleur_b_W, 1L, 135 m]─ junction_valley_W
 #
-#   src_valley_W ─[valley_W_pre, 1L, 870 m]─ junction_valley_W ─[valley_W_post, 1L, 130 m]─ sink_W
+#   src_valley_W ─[valley_W_pre, 1L, 370 m]─ junction_valley_W ─[valley_W_post, 1L, 130 m]─ sink_W
 #
-# Total Valley Road in this direction: 870 + 130 = 1000 m (matches spec).
+# Total Valley Road in this direction: 370 + 130 = 500 m (revised spec).
 
 def build_vwb() -> nx.DiGraph:
     g = nx.DiGraph(name="VWB", display_name="Valley Road Westbound")
+    # Main stretch shrunk from 1000 m → 500 m. Fleur-de-lys still joins 130 m
+    # before the network end, so valley_W_pre = 500 - 130 = 370 m.
     specs = [
-        # Main Valley Road: cut into pre-/post-junction so Fleur-de-lys can
-        # join exactly 130 m before the network end.
         EdgeSpec("src_valley_W",       "junction_valley_W",
-                 "valley_W_pre",   870.0, 1, V_FREE_VALLEY_MPS,
-                 is_inflow=True, role="valley_main_pre"),
+                 "valley_W_pre",   370.0, 1, V_FREE_VALLEY_MPS,
+                 is_inflow=True, role="valley_main_pre",
+                 display_name="Entry 1 (Valley Road)"),
         EdgeSpec("junction_valley_W",  "sink_W",
                  "valley_W_post",  130.0, 1, V_FREE_VALLEY_MPS,
-                 is_exit=True, role="valley_main_post"),
+                 is_exit=True, role="valley_main_post",
+                 display_name="Exit 1 (Valley Road)"),
 
         # Fleur-de-lys branch: 200 m + 135 m, with Psaila joining at the seam.
         EdgeSpec("src_fleur_a",        "junction_fleur_W",
                  "fleur_a_W",      200.0, 1, V_FREE_VALLEY_MPS,
-                 is_inflow=True, role="fleur_de_lys_a"),
+                 is_inflow=True, role="fleur_de_lys_a",
+                 display_name="Entry 2 (Fleur-de-lys)"),
         EdgeSpec("src_psaila_W",       "junction_fleur_W",
                  "psaila_W",       200.0, 1, V_FREE_VALLEY_MPS,
-                 is_inflow=True, role="psaila_street"),
+                 is_inflow=True, role="psaila_street",
+                 display_name="Entry 3 (Psaila Street)"),
         EdgeSpec("junction_fleur_W",   "junction_valley_W",
                  "fleur_b_W",      135.0, 1, V_FREE_VALLEY_MPS,
-                 role="fleur_de_lys_b"),
+                 role="fleur_de_lys_b",
+                 display_name="Valley Road"),
     ]
     _add_edges(g, specs)
     g.graph["inflow_edges"]   = ["valley_W_pre", "fleur_a_W", "psaila_W"]

@@ -2,9 +2,9 @@
   "direction": "valley_west",
   "slot": "5pm",
   "manual_total": 122,
-  "scaling": 1.0625,
-  "injected_total": 129,
+  "scaling": 0.9688,
+  "injected_total": 122,
   "simulated_exit": 122,
-  "iterations": 3,
+  "iterations": 4,
   "match_pct": 0.0
 }
