@@ -121,6 +121,9 @@ Configurable via `config/simulation.yaml`:
 | `greenshields.min_speed_mps`                | 0.5        |
 | `engine.step_s` / `horizon_s` / `bin_seconds` | 1 / 600 / 60 |
 | `engine.closure_start_s`                    | 60         |
+| `engine.cell_length_m`                      | 100.0      |
+| `engine.per_lane_acceptance_per_s`          | 0.6        |
+| `backpressure.downstream_threshold`         | 0.90       |
 | `diversion.saturation_threshold`            | 0.80       |
 | `diversion.weight_growth_k`                 | 8.0        |
 | `diversion.max_divert_share`                | 0.40       |
@@ -145,34 +148,60 @@ Cached at `data/processed/calibration/<direction>_<slot>_injection.json`.
 python simulation/calibrator.py --direction regional_north --slot 10am --verbose
 ```
 
-### Backpressure (capped-transfer, ripple effect)
+### Cell-transmission engine
 
-Each second the engine performs a two-pass update:
+Every edge is subdivided into equal-length **cells** (default ~100 m each),
+configurable via `engine.cell_length_m`. Each cell holds its own particle
+list and computes its own Greenshields speed from its own occupancy. This
+is what makes the visible **speed gradient** along a long edge possible:
+free flow at the entry of `valley_W_pre`, slow-down approaching the
+bottleneck at the far end.
 
-1. **Advance pass.** Every particle moves at its Greenshields-derived speed
-   (motorcycles always at v_free). Particles that reach the end of an edge
-   are parked at `pos_m = length` and queued for transfer to the chosen
-   downstream edge.
+State shape: `state.cells[edge_label][cell_idx] : list[Particle]`. Each
+particle carries `(class, count, pos_m_in_cell)`. Particles cross from
+cell `i` to cell `i+1` when their `pos_m` exceeds the cell length;
+particles in the last cell cross to the first cell of the next edge
+(routing chosen by `_choose_next_edge`).
 
-2. **Capacity-capped transfer.** For each downstream edge, the engine
-   computes its remaining `available_m` and accepts particles in arrival
-   order while available capacity remains. When the downstream edge is
-   above the configurable backpressure threshold (`backpressure.downstream_threshold`,
-   default 0.90), incoming particles are *capped*: the accepted bundle goes
-   to the downstream edge at `pos_m = 0`; the **rejected remainder is
-   pushed back onto the source edge** at `pos_m = length`. Those rejected
-   vehicles count toward upstream occupancy, which causes the heatmap
-   colour to climb on upstream edges over time, producing the visible
-   queue ripple from the bottleneck back toward the network entries.
+### Backpressure (spatial, ripple effect)
 
-3. **Hard closure.** When an edge has `effective_lanes = 0`, every
-   downstream-bound transfer is rejected. If no alternative edge exists,
-   particles are parked on the upstream edge and accrue `cumulative_delay`
-   each second — the same mechanism, just total instead of partial.
+Each second the engine performs a two-pass update **per cell**:
 
-The trade-off vs. simple cell-transmission models: we don't simulate
-sub-second car-following, but the per-second backpressure step gives
-realistic enough queue propagation for 1-min-bin demand and 600 s horizons.
+1. **Advance pass.** Every particle moves at its cell's Greenshields-derived
+   speed (motorcycles always at v_free). Particles that reach the end of a
+   cell are parked at `pos_m = cell_length` and queued for transfer to the
+   chosen downstream cell (next cell on the same edge, or first cell of
+   the next edge).
+
+2. **Capacity-capped transfer.** For each receiving cell, the engine
+   accepts particles in arrival order while available spatial slack
+   remains. Below the configurable backpressure threshold
+   (`backpressure.downstream_threshold`, default 0.90) transfers are free
+   — natural arrivals are paced by the cell-traversal time on the source.
+   At/above the threshold, the engine caps each transfer by the
+   remaining `available_m`: accepted vehicles enter the target at
+   `pos_m = 0`; **rejected vehicles park at the source cell's end** and
+   accrue `cumulative_delay`. Their occupancy counts on the source cell,
+   which raises the source's saturation, which then back-propagates the
+   same way through the upstream cell, all the way to the entry edge.
+
+3. **Source queue.** Vehicles arriving from manual demand wait in a
+   per-edge `source_queue` if cell 0 of their inflow edge is already
+   saturated. Each second the engine drains the queue into cell 0 subject
+   to backpressure. This is how the **merge bottleneck (item 3a)**
+   manifests: when the trunk's first cell saturates, both inflow edges'
+   first cells back up, then their source queues. Mass is preserved
+   exactly: every vehicle is either still queued at its source, still in
+   the network, or counted in `exit_total` / `escape_total`.
+
+4. **Hard closure.** When `effective_lanes = 0`, every downstream-bound
+   transfer is rejected. If no alternative edge exists, particles park on
+   the upstream cell and accrue delay until the closure lifts.
+
+5. **Demand smearing.** Each minute's pulse is spread uniformly across
+   the 60 seconds of the bin so injection looks like a steady stream
+   rather than a sudden burst. Largest-remainder rounding preserves bin
+   totals exactly.
 
 ### Dynamic diversion (Q3 — Pressure-Valve)
 
@@ -216,11 +245,12 @@ cumulative_delay, effective_lanes
 Particles schema (one row per `sim_second × particle`):
 
 ```
-time_s, edge, cls, count, pos_m, pos_frac
+time_s, edge, cls, count, pos_m, pos_frac, cell_idx
 ```
 
-`pos_frac` is `pos_m / edge_length` — used by the visualiser to interpolate
-dot positions smoothly along each edge.
+`pos_frac` is `pos_m / edge_length` (the *global* position along the edge,
+combining cell index + intra-cell position) — used by the visualiser to
+interpolate dot positions smoothly across cell boundaries.
 
 `cumulative_delay` is the Phase 4 ML target.
 
@@ -231,10 +261,12 @@ python simulation/scenarios.py --all
 
 ### Visualisation (Q8 — abstract layout, currently)
 
-`simulation/visualizer.py` opens a Matplotlib window with a NetworkX
-spring layout of the chosen network. Every edge and every particle is
-rendered concurrently in each 1-second frame, so split points (diverges)
-and merges are visible in real time.
+`simulation/visualizer.py` opens a Matplotlib window with a **hardcoded
+layout** (one per network — defined in `simulation/networks.py:NODE_LAYOUTS`)
+so each direction has a stable, topology-faithful node arrangement that
+will line up cleanly when real-world top-down images are added in Phase 3.
+Every edge and every particle is rendered concurrently in each 1-second
+frame, so split points (diverges) and merges are visible in real time.
 
 | Range          | Edge colour |
 | -------------- | ----------- |

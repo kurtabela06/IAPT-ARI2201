@@ -3,11 +3,13 @@
   "direction": "regional_south",
   "slot": "1pm",
   "variant": "2_lanes_closed",
-  "exit_total": 103,
+  "exit_total": 169,
   "escape_total": 0,
-  "total_delay_veh_s": 108058.35,
+  "queued_at_entry": 522,
+  "still_in_network": 97,
+  "total_delay_veh_s": 202303.74,
   "scaling_applied": 1.0,
   "manual_slot": "1pm",
-  "calibration_scl": 1.0156,
-  "injection_count": 398
+  "calibration_scl": 1.9883,
+  "injection_count": 788
 }

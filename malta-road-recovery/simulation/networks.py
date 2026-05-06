@@ -276,6 +276,50 @@ DIRECTION_TO_NETWORK = {
     "valley_west":    "VWB",
 }
 
+# ---------------------------------------------------------------------------
+# Hardcoded node positions per network — used by the visualizer instead of
+# nx.spring_layout. Coordinates are abstract (no real-world meaning) but
+# arranged so the topology reads naturally on screen:
+#   inflows on the left, outflows on the right; merge / split nodes line up
+#   vertically; long edges get more horizontal room.
+# ---------------------------------------------------------------------------
+
+NODE_LAYOUTS: dict[str, dict[str, tuple[float, float]]] = {
+    "RNB": {
+        # Two inflows (top + bottom) merge → trunk → diverge → main+escape
+        "src_main_N":      (-0.7,  +0.5),
+        "src_underpass_N": (-0.7,  -0.5),
+        "merge_join_N":    ( 0.0,   0.0),
+        "diverge_N":       ( 0.5,   0.0),
+        "sink_final_N":    ( 1.5,  +0.4),
+        "sink_escape_N":   ( 1.5,  -0.4),
+    },
+    "RSB": {
+        "src_flyover_S":   (-0.7,  +0.5),
+        "src_underpass_S": (-0.7,  -0.5),
+        "merge_S":         ( 0.0,   0.0),
+        "diverge_S":       ( 0.6,   0.0),
+        "sink_main_S":     ( 1.5,  +0.4),
+        "sink_escape_S":   ( 1.5,  -0.4),
+    },
+    "VEB": {
+        # Single inflow → branch → main vs Naxxar diversion
+        "src_valley_E":    (-0.8,   0.0),
+        "branch_E":        ( 0.0,   0.0),
+        "sink_main_E":     ( 1.0,  +0.4),
+        "sink_naxxar_E":   ( 1.0,  -0.4),
+    },
+    "VWB": {
+        # 3-way merge: Psaila + Fleur-de-lys, plus the long Valley pre-edge
+        "src_valley_W":      (-1.2,   0.0),
+        "src_fleur_a":       (-0.7,  -0.7),
+        "src_psaila_W":      (-0.7,  -0.4),
+        "junction_fleur_W":  (-0.2,  -0.55),
+        "junction_valley_W": ( 0.4,   0.0),
+        "sink_W":            ( 1.0,   0.0),
+    },
+}
+
 
 def build_network(key: str) -> nx.DiGraph:
     if key not in NETWORK_BUILDERS:
@@ -285,3 +329,8 @@ def build_network(key: str) -> nx.DiGraph:
 
 def build_all_networks() -> dict[str, nx.DiGraph]:
     return {k: f() for k, f in NETWORK_BUILDERS.items()}
+
+
+def get_layout(key: str) -> dict[str, tuple[float, float]]:
+    """Return the hardcoded (x, y) layout for a network key."""
+    return dict(NODE_LAYOUTS[key])

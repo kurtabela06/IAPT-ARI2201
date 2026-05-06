@@ -2,9 +2,9 @@
   "direction": "valley_east",
   "slot": "5pm",
   "manual_total": 116,
-  "scaling": 0.9688,
-  "injected_total": 116,
-  "simulated_exit": 116,
+  "scaling": 1.3438,
+  "injected_total": 151,
+  "simulated_exit": 114,
   "iterations": 4,
-  "match_pct": 0.0
+  "match_pct": 1.724
 }

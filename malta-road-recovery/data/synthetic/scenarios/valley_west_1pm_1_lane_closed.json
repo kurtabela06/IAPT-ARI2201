@@ -3,11 +3,13 @@
   "direction": "valley_west",
   "slot": "1pm",
   "variant": "1_lane_closed",
-  "exit_total": 4,
+  "exit_total": 5,
   "escape_total": 0,
-  "total_delay_veh_s": 45519.59,
+  "queued_at_entry": 0,
+  "still_in_network": 126,
+  "total_delay_veh_s": 54800.29,
   "scaling_applied": 1.0,
   "manual_slot": "1pm",
-  "calibration_scl": 1.0625,
-  "injection_count": 126
+  "calibration_scl": 1.0859,
+  "injection_count": 131
 }

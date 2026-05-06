@@ -37,7 +37,7 @@ import matplotlib.animation as anim
 import networkx as nx
 import pandas as pd
 
-from simulation.networks import build_network, DIRECTION_TO_NETWORK
+from simulation.networks import build_network, DIRECTION_TO_NETWORK, get_layout
 
 
 CLASS_COLOR = {
@@ -116,7 +116,7 @@ def visualise_scenario(
     times    = sorted(edge_df["time_s"].unique())
     edges    = list(g.edges(data=True))
 
-    pos = nx.spring_layout(g, seed=42, k=1.6, iterations=200)
+    pos = get_layout(network_key)
 
     fig, ax = plt.subplots(figsize=(15, 9))
     ax.set_aspect("equal")

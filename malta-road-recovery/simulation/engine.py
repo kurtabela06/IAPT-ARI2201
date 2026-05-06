@@ -1,41 +1,37 @@
 """
 simulation/engine.py
 ====================
-Custom NetworkX-based traffic engine.
+Custom NetworkX-based traffic engine — cell-transmission flavour.
 
-Macro-particle model: instead of tracking each vehicle individually we track
-"particles" on each edge — small bundles of homogeneous vehicles that share
-a position offset. Each particle carries (class, count, distance_on_edge).
-This keeps the simulation fast (≤ 1 ms per step on Phase 2 networks) while
-still resolving heterogeneous fleet dynamics.
+Each road **edge** is subdivided into a sequence of small **cells**
+(default ~100 m each). Cells are the smallest unit of state in the engine:
 
-Dynamics per simulation second:
+  state.cells[edge_label][cell_idx] : list[Particle]
 
-  1.  Inject demand for the current 1-minute bin (if any), apportioned across
-      the network's inflow edges by their share of total inflow capacity.
+Particles carry (class, count, pos_m_in_cell). Their speed is determined by
+*their cell's* occupancy, not the whole edge — so a long edge with a queue
+near the exit shows a clear speed gradient (free flow at the entry, slow
+at the bottleneck).
 
-  2.  For each edge, compute spatial occupancy:
-            occupied_m = sum(car.count*5 + hgv.count*8 over particles on edge)
-            ratio      = occupied_m / max_occupancy_m   (clamped [0, 1])
+Per-second update:
 
-  3.  For each particle on each edge, advance distance_on_edge:
-            cars/HGV : v = v_free * (1 - ratio)        (Greenshields)
-            motos    : v = v_free                       (queue-filter)
-      …subject to a configured `min_speed_mps` floor.
+  1. Inject demand pulse if a 1-minute boundary just crossed.
+  2. Advance pass: every particle moves at its cell's Greenshields speed
+     (motorcycles always at v_free). Particles that overflow their cell are
+     parked at cell-end and queued for transfer to the next cell (or the
+     next edge, if they were in the last cell).
+  3. Capacity-capped transfer pass:
+       a. Each receiving cell can accept at most `eff_lanes × per_second_acc`
+          vehicles per second (default 0.6 veh/s/lane ≈ 2200 veh/hr/lane).
+       b. AND at most `available_m / vehicle_length` worth of spatial slack.
+       Whichever is tighter wins. Rejected particles park at the source
+       cell's end and accrue cumulative_delay.
+       At a merge node, both inbound edges' particles compete for the same
+       trunk cell — natural merge bottleneck (item 3a).
+  4. Telemetry: per-edge AND per-cell rows + per-particle position log.
 
-  4.  Particles that cross the edge end transfer to a downstream edge chosen
-      by routing logic (see `_choose_next_edge`). At diverge nodes we use
-      `nx.shortest_path` over weights inflated by the saturation of the
-      downstream edges — this realises Q3 dynamic diversion / Pressure-Valve.
-
-  5.  Telemetry: per-edge metrics are written to a list-of-dicts that the
-      caller turns into a pandas DataFrame at the end of the run. The
-      `cumulative_delay` column accumulates the difference between actual
-      and free-flow travel time across all vehicles on the edge.
-
-A single `Scenario` object describes one (network × demand × variant) run.
-A scenario is run with `simulate(scenario, ...)` returning the telemetry
-DataFrame plus a `summary` dict (exit count, total delay, recovery flags).
+A single `Scenario` describes one (network × demand × variant) run.
+`simulate(scenario, ...)` returns (telemetry_df, particles_df, summary).
 """
 
 from __future__ import annotations
@@ -49,24 +45,30 @@ import networkx as nx
 import pandas as pd
 import yaml
 
-# ---------------------------------------------------------------------------
-# Defaults — overridden by config/simulation.yaml when run via the CLI.
-# ---------------------------------------------------------------------------
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_SIM   = PROJECT_ROOT / "config" / "simulation.yaml"
 
 VEHICLE_CLASSES = ("car", "hgv", "motorcycle")
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursive dict merge — values in `overlay` override `base`,
+    sub-dicts merged at every level rather than wholesale replaced."""
+    out = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def load_engine_config() -> dict:
     if not CONFIG_SIM.exists():
         return _DEFAULT_CFG.copy()
     with open(CONFIG_SIM) as f:
-        cfg = yaml.safe_load(f)
-    out = _DEFAULT_CFG.copy()
-    out.update(cfg or {})
-    return out
+        cfg = yaml.safe_load(f) or {}
+    return _deep_merge(_DEFAULT_CFG, cfg)
 
 
 _DEFAULT_CFG = {
@@ -76,8 +78,16 @@ _DEFAULT_CFG = {
         "motorcycle": {"length_m": 0.5, "contributes_to_occupancy": False},
     },
     "greenshields": {"jam_ratio_cap": 1.0, "min_speed_mps": 0.5},
-    "engine":       {"step_s": 1, "horizon_s": 600, "bin_seconds": 60,
-                     "closure_start_s": 60},
+    "engine":       {
+        "step_s":          1,
+        "horizon_s":       600,
+        "bin_seconds":     60,
+        "closure_start_s": 60,
+        "cell_length_m":   100.0,    # target cell size; actual cells are
+                                     # equal-length within an edge, derived
+                                     # from edge length / cell_length_m.
+        "per_lane_acceptance_per_s": 0.6,   # ≈ 2160 veh/hr/lane saturation
+    },
     "diversion":    {"saturation_threshold": 0.80,
                      "weight_growth_k":     8.0,
                      "max_divert_share":    0.40},
@@ -91,22 +101,33 @@ _DEFAULT_CFG = {
 
 @dataclass
 class Particle:
-    """A homogeneous bundle of vehicles travelling along one edge."""
+    """A homogeneous bundle of vehicles travelling along one edge cell."""
     cls:      str         # 'car' | 'hgv' | 'motorcycle'
     count:    int
-    pos_m:    float       # distance from edge source, in metres
+    pos_m:    float       # distance from the start of the *cell*
 
 
 @dataclass
 class Scenario:
-    """One experiment: a network, a per-bin demand schedule, and an incident."""
-    network_key:  str                          # 'RNB' | 'RSB' | 'VEB' | 'VWB'
-    direction:    str                          # 'regional_north' | …  (CSV name)
-    slot:         str                          # '08:00' / '10am' / …
-    variant:      str                          # 'all_open' | '1_lane_closed' | 'full_closure'
-    pulses:       list[dict]                   # one dict per 1-min bin, e.g.
-                                               #   {'car':30,'hgv':5,'motorcycle':3,'incident_status':'clear'}
-    injection_count: Optional[int] = None      # set by calibrator (Q4)
+    network_key:     str
+    direction:       str
+    slot:            str
+    variant:         str
+    pulses:          list[dict]
+    injection_count: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Edge → cell layout
+# ---------------------------------------------------------------------------
+
+def _num_cells_for(length_m: float, cfg: dict) -> int:
+    target = cfg["engine"]["cell_length_m"]
+    return max(1, int(round(length_m / target)))
+
+
+def _cell_length(length_m: float, num_cells: int) -> float:
+    return length_m / num_cells
 
 
 # ---------------------------------------------------------------------------
@@ -117,26 +138,36 @@ class Scenario:
 class _EngineState:
     cfg:       dict
     g:         nx.DiGraph
-    particles: dict[str, list[Particle]] = field(default_factory=dict)   # edge_label → particles
-    cum_delay: dict[str, float]          = field(default_factory=dict)   # edge_label → seconds
-    exit_counts: dict[str, dict[str, int]] = field(default_factory=dict) # edge_label → {cls: count}
-    rows:      list[dict]                = field(default_factory=list)
-    effective_lanes: dict[str, int]      = field(default_factory=dict)   # closure-aware
+    cells:     dict[str, list[list[Particle]]] = field(default_factory=dict)   # edge → cells of particles
+    num_cells: dict[str, int]                  = field(default_factory=dict)
+    cell_len:  dict[str, float]                = field(default_factory=dict)
+    cum_delay: dict[str, float]                = field(default_factory=dict)
+    exit_counts: dict[str, dict[str, int]]     = field(default_factory=dict)
+    edge_rows:     list[dict]                  = field(default_factory=list)
+    cell_rows:     list[dict]                  = field(default_factory=list)
+    effective_lanes: dict[str, int]            = field(default_factory=dict)
+    # Source queue per inflow edge — vehicles waiting to enter when cell 0
+    # is already saturated. Each item is a Particle (count + class).
+    source_queue: dict[str, list[Particle]]    = field(default_factory=dict)
 
 
 def _init_state(g: nx.DiGraph, cfg: dict) -> _EngineState:
     st = _EngineState(cfg=cfg, g=g)
     for u, v, d in g.edges(data=True):
         lbl = d["label"]
-        st.particles[lbl] = []
+        n = _num_cells_for(d["length_m"], cfg)
+        st.cells[lbl] = [[] for _ in range(n)]
+        st.num_cells[lbl] = n
+        st.cell_len[lbl]  = _cell_length(d["length_m"], n)
         st.cum_delay[lbl] = 0.0
         st.exit_counts[lbl] = {c: 0 for c in VEHICLE_CLASSES}
         st.effective_lanes[lbl] = d["lanes"]
+        st.source_queue[lbl] = []
     return st
 
 
 # ---------------------------------------------------------------------------
-# Helpers — edge lookup, occupancy, speed
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _edge_data_by_label(g: nx.DiGraph, label: str) -> tuple[str, str, dict]:
@@ -146,7 +177,7 @@ def _edge_data_by_label(g: nx.DiGraph, label: str) -> tuple[str, str, dict]:
     raise KeyError(f"No edge labelled '{label}' on graph {g.graph.get('name')}")
 
 
-def _occupancy_metres(particles: list[Particle], cfg: dict) -> float:
+def _cell_occupancy_metres(particles: list[Particle], cfg: dict) -> float:
     veh_cfg = cfg["vehicles"]
     occ = 0.0
     for p in particles:
@@ -156,9 +187,18 @@ def _occupancy_metres(particles: list[Particle], cfg: dict) -> float:
     return occ
 
 
-def _max_occupancy_for(state: _EngineState, label: str, edge_data: dict) -> float:
-    """Max occupancy in metres, accounting for closures (effective_lanes)."""
-    eff_lanes = state.effective_lanes.get(label, edge_data["lanes"])
+def _cell_max_m(state: _EngineState, edge_label: str) -> float:
+    """Per-cell capacity = cell_length × effective_lanes."""
+    eff_lanes = state.effective_lanes.get(edge_label, 0)
+    return state.cell_len[edge_label] * max(eff_lanes, 0)
+
+
+def _edge_total_occupancy(state: _EngineState, edge_label: str, cfg: dict) -> float:
+    return sum(_cell_occupancy_metres(c, cfg) for c in state.cells[edge_label])
+
+
+def _edge_max_m(state: _EngineState, edge_label: str, edge_data: dict) -> float:
+    eff_lanes = state.effective_lanes.get(edge_label, edge_data["lanes"])
     return edge_data["length_m"] * max(eff_lanes, 0)
 
 
@@ -170,33 +210,18 @@ def _greenshields_speed(v_free: float, ratio: float, cfg: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Routing — choose the next edge at a node, with dynamic diversion
+# Routing — diverge nodes use the *first cell* of each candidate edge for
+# saturation feedback (since that's the cell that would receive the particle).
 # ---------------------------------------------------------------------------
 
-def _choose_next_edge(
-    state:     _EngineState,
-    node:      str,
-    cls:       str,
-    rng_share: float,         # uniform [0,1) random number for the particle
-) -> Optional[str]:
-    """
-    Pick the next edge label leaving *node*. If the node has multiple
-    outgoing edges, weight them by free-flow capacity then inflate weights
-    by saturation (Q3 dynamic diversion / Pressure-Valve).
-
-    Motorcycles never divert — they always take the primary path because
-    they are queue-filtering and don't experience congestion.
-    """
+def _choose_next_edge(state: _EngineState, node: str, cls: str,
+                      rng_share: float) -> Optional[str]:
     out_edges = list(state.g.out_edges(node, data=True))
     if not out_edges:
         return None
-
     if len(out_edges) == 1:
         return out_edges[0][2]["label"]
 
-    # Build per-edge weights. Default = inverse free-flow capacity (so wider,
-    # faster edges are preferred). Then inflate weights when downstream is
-    # saturated, pushing flow onto the escape route.
     diversion_cfg = state.cfg["diversion"]
     threshold = diversion_cfg["saturation_threshold"]
     growth_k  = diversion_cfg["weight_growth_k"]
@@ -206,23 +231,20 @@ def _choose_next_edge(
     for _u, _v, d in out_edges:
         lbl = d["label"]
         cap_inv = 1.0 / max(d["max_occupancy_m"], 1.0)
-
-        max_occ = _max_occupancy_for(state, lbl, d)
-        if max_occ <= 0:
-            # Edge fully closed — treat as infinitely costly so diversion fires.
+        edge_max = _edge_max_m(state, lbl, d)
+        if edge_max <= 0:
             weight = float("inf")
         else:
-            ratio = _occupancy_metres(state.particles[lbl], state.cfg) / max_occ
+            edge_occ = _edge_total_occupancy(state, lbl, state.cfg)
+            ratio = edge_occ / edge_max
             overflow = max(0.0, ratio - threshold)
             weight = cap_inv * math.exp(min(growth_k * overflow, 50.0))
         base_weights.append((lbl, weight))
 
-    # Identify the "main" edge (lowest non-escape weight at free flow) and
-    # the "escape" edge (`is_escape=True`). For motos always pick main.
     main_lbl = None
     escape_lbl = None
     main_score = math.inf
-    for u, v, d in out_edges:
+    for _u, _v, d in out_edges:
         if d.get("is_escape"):
             escape_lbl = d["label"]
         else:
@@ -235,7 +257,6 @@ def _choose_next_edge(
         return main_lbl
 
     if escape_lbl is None:
-        # No escape edge — distribute by inverse weight.
         total = sum(1.0 / w for _, w in base_weights)
         cum = 0.0
         for lbl, w in base_weights:
@@ -244,9 +265,6 @@ def _choose_next_edge(
                 return lbl
         return base_weights[-1][0]
 
-    # Compute divert share = how saturated the main edge is, capped by max_div.
-    # Special case: if main is fully closed (weight=inf) divert *everything* —
-    # the cap only applies to dynamic-spill cases, not to hard closures.
     main_w   = next(w for lbl, w in base_weights if lbl == main_lbl)
     escape_w = next(w for lbl, w in base_weights if lbl == escape_lbl)
     if main_w == float("inf"):
@@ -259,15 +277,67 @@ def _choose_next_edge(
 
 
 # ---------------------------------------------------------------------------
-# Demand injection
+# Demand injection — into cell 0 of each inflow edge
 # ---------------------------------------------------------------------------
 
+def _largest_remainder(n: int, weights: list[float]) -> list[int]:
+    """Distribute integer *n* across len(weights) buckets proportional to
+    *weights*, preserving the total via largest-remainder rounding."""
+    total_w = sum(weights) or 1.0
+    raw = [n * w / total_w for w in weights]
+    base = [int(x) for x in raw]
+    rem = n - sum(base)
+    if rem > 0:
+        order = sorted(range(len(weights)), key=lambda i: raw[i] - base[i],
+                       reverse=True)
+        for i in order[:rem]:
+            base[i] += 1
+    return base
+
+
+def _inject_pulse_smeared(state: _EngineState, pulse: dict, *,
+                          scaling: float, offset_in_bin: int,
+                          bin_secs: int) -> None:
+    """
+    Spread a 1-minute demand pulse uniformly across `bin_secs` seconds and
+    across the network's inflow edges (weighted by their free-flow capacity).
+
+    Per call we inject exactly the slice of the bin that corresponds to
+    `offset_in_bin` (0..bin_secs-1). Apportionment is computed in two stages:
+      1. n_per_edge[cls][lbl]  = bin total for cls, distributed across edges
+      2. n_per_second[cls][lbl] = the (edge×class) total, distributed across
+                                  the bin's seconds.
+    Both stages use largest-remainder rounding so per-bin totals are exact.
+    """
+    inflow_labels = state.g.graph.get("inflow_edges", [])
+    if not inflow_labels:
+        return
+
+    caps_for_lbl = []
+    for lbl in inflow_labels:
+        _, _, d = _edge_data_by_label(state.g, lbl)
+        caps_for_lbl.append(d["max_occupancy_m"])
+
+    for cls in VEHICLE_CLASSES:
+        n_total = int(round(pulse.get(cls, 0) * scaling))
+        if n_total <= 0:
+            continue
+        per_edge = _largest_remainder(n_total, caps_for_lbl)
+        for lbl, edge_total in zip(inflow_labels, per_edge):
+            if edge_total <= 0:
+                continue
+            seconds_w = [1.0] * bin_secs
+            per_sec = _largest_remainder(edge_total, seconds_w)
+            n_now = per_sec[offset_in_bin]
+            if n_now > 0:
+                # Park in the source queue; the main loop drains it into cell 0
+                # subject to backpressure.
+                state.source_queue[lbl].append(
+                    Particle(cls=cls, count=n_now, pos_m=0.0)
+                )
+
+
 def _inject_pulse(state: _EngineState, pulse: dict, scaling: float = 1.0) -> None:
-    """
-    Apportion this minute's demand across the network's inflow edges by their
-    share of total inflow free-flow capacity (max_occupancy_m). Vehicles
-    arrive at the start of each inflow edge as a single particle.
-    """
     inflow_labels = state.g.graph.get("inflow_edges", [])
     if not inflow_labels:
         return
@@ -282,7 +352,6 @@ def _inject_pulse(state: _EngineState, pulse: dict, scaling: float = 1.0) -> Non
         n = int(round(pulse.get(cls, 0) * scaling))
         if n <= 0:
             continue
-        # Distribute via largest-remainder rounding so totals are preserved.
         raw = [(lbl, n * c / total_cap) for lbl, c in caps]
         base = [(lbl, int(x), x - int(x)) for lbl, x in raw]
         used = sum(b for _, b, _ in base)
@@ -294,29 +363,35 @@ def _inject_pulse(state: _EngineState, pulse: dict, scaling: float = 1.0) -> Non
                 base[i] = (lbl, b + 1, frac)
         for lbl, count, _ in base:
             if count > 0:
-                state.particles[lbl].append(Particle(cls=cls, count=count, pos_m=0.0))
+                # Inject into cell 0 of the inflow edge at pos_m=0.
+                state.cells[lbl][0].append(Particle(cls=cls, count=count, pos_m=0.0))
+
+
+# ---------------------------------------------------------------------------
+# Per-cell speed
+# ---------------------------------------------------------------------------
+
+def _cell_speed(state: _EngineState, edge_label: str, cell_idx: int,
+                v_free: float, cfg: dict, *, motorcycle: bool) -> float:
+    if motorcycle:
+        return v_free
+    occ = _cell_occupancy_metres(state.cells[edge_label][cell_idx], cfg)
+    cap = _cell_max_m(state, edge_label)
+    if cap <= 0:
+        return cfg["greenshields"]["min_speed_mps"]
+    ratio = occ / cap
+    return _greenshields_speed(v_free, ratio, cfg)
 
 
 # ---------------------------------------------------------------------------
 # Main simulation loop
 # ---------------------------------------------------------------------------
 
-def simulate(scenario: Scenario,
-             *,
-             rng_seed: int = 42,
+def simulate(scenario: Scenario, *, rng_seed: int = 42,
              cfg: Optional[dict] = None,
              g_override: Optional[nx.DiGraph] = None,
-             emit_particles: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """
-    Run a single Scenario.
-
-    Returns (telemetry_df, particles_df, summary_dict):
-      - telemetry_df : one row per (sim_second × edge)
-      - particles_df : one row per (sim_second × particle), giving the exact
-                       position of every vehicle bundle on every edge so
-                       the visualiser can interpolate dot positions smoothly
-      - summary_dict : aggregate metrics for the run
-    """
+             emit_particles: bool = True
+             ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     import random
     rng = random.Random(rng_seed)
 
@@ -330,20 +405,17 @@ def simulate(scenario: Scenario,
     horizon  = cfg["engine"]["horizon_s"]
     bin_secs = cfg["engine"]["bin_seconds"]
     closure_start = cfg["engine"]["closure_start_s"]
-
-    # Backpressure trigger: when downstream occupancy ≥ this, transfers are
-    # capped by the remaining available metres. Below it, transfers are free.
-    backpressure_threshold = cfg.get("backpressure", {}).get("downstream_threshold", 0.90)
+    per_lane_acc  = cfg["engine"]["per_lane_acceptance_per_s"]
+    bp_threshold  = cfg["backpressure"]["downstream_threshold"]
 
     state = _init_state(g, cfg)
 
-    # Per-particle position log (Fix 1b + Fix 3 visualisation).
     particles_rows: list[dict] = []
 
     if scenario.injection_count is not None and scenario.pulses:
         target_total = scenario.injection_count
         observed_total = sum(p.get("car",0) + p.get("hgv",0) + p.get("motorcycle",0)
-                              for p in scenario.pulses)
+                             for p in scenario.pulses)
         scaling = (target_total / observed_total) if observed_total > 0 else 1.0
     else:
         scaling = 1.0
@@ -357,156 +429,181 @@ def simulate(scenario: Scenario,
     }.get(scenario.variant, 0)
 
     for t in range(horizon + 1):
-        # ── 1. Apply closure if scheduled ────────────────────────────────
-        if t == closure_start and closeable and closure_lane_drop is not None:
-            _, _, d = _edge_data_by_label(g, closeable)
-            new_lanes = max(d["lanes"] - closure_lane_drop, 0)
-            state.effective_lanes[closeable] = new_lanes
-        if t == closure_start and closeable and closure_lane_drop is None:
-            state.effective_lanes[closeable] = 0
+        # ── 1. Apply closure if scheduled ──────────────────────────────
+        if t == closure_start and closeable:
+            _, _, cd = _edge_data_by_label(g, closeable)
+            if closure_lane_drop is None:
+                state.effective_lanes[closeable] = 0
+            else:
+                state.effective_lanes[closeable] = max(cd["lanes"] - closure_lane_drop, 0)
 
-        # ── 2. Inject this minute's demand pulse ─────────────────────────
-        if t % bin_secs == 0:
-            bin_idx = t // bin_secs
-            if bin_idx < len(scenario.pulses):
-                _inject_pulse(state, scenario.pulses[bin_idx], scaling=scaling)
+        # ── 2. Inject demand pulse, smeared across the minute ──────────
+        bin_idx = t // bin_secs
+        if bin_idx < len(scenario.pulses):
+            _inject_pulse_smeared(state, scenario.pulses[bin_idx],
+                                  scaling=scaling,
+                                  offset_in_bin=t % bin_secs,
+                                  bin_secs=bin_secs)
 
-        # ── 3. First pass: advance positions in place, collect transfer requests
-        # ────────────────────────────────────────────────────────────────
-        # `transfer_requests` maps target_edge_label → list of (Particle, src_edge)
-        # tuples, in arrival order.  We resolve them after every edge has
-        # advanced, so capacity decisions see all arrivals at once.
-        transfer_requests: dict[str, list[tuple[Particle, str]]] = {}
-        sink_arrivals: list[tuple[Particle, str]] = []   # particles exiting the network
-
-        for src_node, dst_node, d in g.edges(data=True):
-            lbl    = d["label"]
-            length = d["length_m"]
-            v_free = d["v_free_mps"]
-
-            eff_lanes = state.effective_lanes.get(lbl, d["lanes"])
-            if eff_lanes == 0:
-                stranded = sum(p.count for p in state.particles[lbl])
-                state.cum_delay[lbl] += stranded * 1.0
+        # ── 2b. Drain the source queue into cell 0 of each inflow ──────
+        # Vehicles wait in the queue when cell 0 is saturated; each second
+        # we try to push as much of the queue as the cell will accept.
+        for lbl in state.source_queue:
+            if not state.source_queue[lbl]:
                 continue
+            eff_lanes = state.effective_lanes.get(lbl, 0)
+            if eff_lanes == 0:
+                # Edge closed: keep waiting, accrue delay.
+                stuck = sum(p.count for p in state.source_queue[lbl])
+                state.cum_delay[lbl] += stuck * 1.0
+                continue
+            cell_max_m  = _cell_max_m(state, lbl)
+            cell_used   = _cell_occupancy_metres(state.cells[lbl][0], cfg)
+            cell_ratio  = (cell_used / cell_max_m) if cell_max_m > 0 else 1.0
+            available_m = max(cell_max_m - cell_used, 0.0)
 
-            occ_m = _occupancy_metres(state.particles[lbl], cfg)
-            max_m = max(length * eff_lanes, 1.0)
-            ratio = occ_m / max_m
-            v_other = _greenshields_speed(v_free, ratio, cfg)
+            still_queued: list[Particle] = []
+            for p in state.source_queue[lbl]:
+                vc = cfg["vehicles"].get(p.cls, {})
+                len_per = vc.get("length_m", 0.0)
+                contributes = vc.get("contributes_to_occupancy", False)
 
-            still_here:  list[Particle] = []
-            for p in state.particles[lbl]:
-                speed = v_free if p.cls == "motorcycle" else v_other
-                p.pos_m += speed * 1.0
-                if p.cls != "motorcycle" and speed < v_free:
-                    state.cum_delay[lbl] += p.count * (1.0 - speed / v_free)
-                if p.pos_m >= length:
-                    # Park at the edge end; resolution happens in pass 2.
-                    p.pos_m = length
-                    next_lbl = _choose_next_edge(state, dst_node, p.cls, rng.random())
-                    if next_lbl is None:
-                        # No outgoing edge → genuine network exit (sink).
-                        sink_arrivals.append((p, lbl))
-                    else:
-                        # Reroute around fully-closed downstream edges.
-                        if state.effective_lanes.get(next_lbl, 1) == 0:
-                            fallback = None
-                            for _u, _v, dd in g.out_edges(dst_node, data=True):
-                                if state.effective_lanes.get(dd["label"], dd["lanes"]) > 0:
-                                    fallback = dd["label"]
-                                    break
-                            if fallback is None:
-                                # Every downstream edge is closed — park the
-                                # particle here and accrue delay. This is the
-                                # backpressure trigger that ripples upstream.
-                                still_here.append(p)
-                                state.cum_delay[lbl] += p.count * 1.0
-                                continue
-                            next_lbl = fallback
-                        transfer_requests.setdefault(next_lbl, []).append((p, lbl))
-                else:
-                    still_here.append(p)
-            state.particles[lbl] = still_here
-
-        # ── 4. Capacity-capped transfers (Backpressure / Fix 1) ──────────
-        # For each target edge, accept particles in arrival order until the
-        # remaining capacity is exhausted (only when the edge is at or above
-        # the backpressure threshold). Rejected particles stay parked at the
-        # end of their source edge — they accrue delay there and contribute
-        # to upstream occupancy, causing the queue to ripple upstream.
-        for target, arrivals in transfer_requests.items():
-            _, _, td = _edge_data_by_label(g, target)
-            tgt_eff_lanes = state.effective_lanes.get(target, td["lanes"])
-            tgt_max_m   = td["length_m"] * max(tgt_eff_lanes, 0)
-            tgt_used    = _occupancy_metres(state.particles[target], cfg)
-            tgt_ratio   = (tgt_used / tgt_max_m) if tgt_max_m > 0 else 1.0
-            available_m = max(tgt_max_m - tgt_used, 0.0)
-
-            for p, src_lbl in arrivals:
-                veh_cfg = cfg["vehicles"].get(p.cls, {})
-                len_per = veh_cfg.get("length_m", 0.0)
-                contributes = veh_cfg.get("contributes_to_occupancy", False)
-
-                # Free transfer when target is below backpressure threshold,
-                # OR the particle doesn't contribute to occupancy AND target
-                # is not fully closed (motorcycles squeeze through queues).
-                free_transfer = (
-                    tgt_eff_lanes > 0
-                    and (not contributes or tgt_ratio < backpressure_threshold)
-                )
-
-                if free_transfer:
-                    state.particles[target].append(
+                if (not contributes) or (cell_ratio < bp_threshold):
+                    state.cells[lbl][0].append(
                         Particle(cls=p.cls, count=p.count, pos_m=0.0)
                     )
                     if contributes:
-                        added = p.count * len_per
-                        tgt_used += added
-                        available_m = max(tgt_max_m - tgt_used, 0.0)
-                        tgt_ratio = tgt_used / tgt_max_m if tgt_max_m > 0 else 1.0
+                        cell_used += p.count * len_per
+                        available_m = max(cell_max_m - cell_used, 0.0)
+                        cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
                     continue
 
-                # Capped transfer — accept up to available capacity, park rest.
-                accept_n = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
-                accept_n = max(0, min(accept_n, p.count))
+                max_by_space = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
+                accept_n = max(min(p.count, max_by_space), 0)
                 if accept_n > 0:
-                    state.particles[target].append(
+                    state.cells[lbl][0].append(
                         Particle(cls=p.cls, count=accept_n, pos_m=0.0)
                     )
-                    added = accept_n * len_per
-                    tgt_used += added
-                    available_m = max(tgt_max_m - tgt_used, 0.0)
-                    tgt_ratio = tgt_used / tgt_max_m if tgt_max_m > 0 else 1.0
-                # The rest are pushed back onto the source edge, parked at
-                # the end. They will accrue delay until headroom opens up.
+                    cell_used += accept_n * len_per
+                    available_m = max(cell_max_m - cell_used, 0.0)
+                    cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
                 rejected = p.count - accept_n
                 if rejected > 0:
-                    src_len = next(d["length_m"] for _u,_v,d in g.edges(data=True)
-                                   if d["label"] == src_lbl)
-                    state.particles[src_lbl].append(
-                        Particle(cls=p.cls, count=rejected, pos_m=src_len)
+                    still_queued.append(
+                        Particle(cls=p.cls, count=rejected, pos_m=0.0)
                     )
-                    # Each rejected vehicle loses a full second of free flow:
-                    state.cum_delay[src_lbl] += rejected * 1.0
+                    state.cum_delay[lbl] += rejected * 1.0
+            state.source_queue[lbl] = still_queued
+
+        # ── 3. Advance pass — within each cell ─────────────────────────
+        # `boundary_arrivals[(edge_label, cell_idx)]` collects particles
+        # that overflowed cell (cell_idx-1) and want to enter cell_idx of
+        # the same edge OR (when cell_idx=='exit') particles that overflowed
+        # the last cell and want to enter the next edge.
+        edge_to_edge_arrivals: dict[str, list[tuple[Particle, str, int]]] = {}
+        # entries: (particle, src_edge_label, src_cell_idx)
+        intra_edge_arrivals: dict[tuple[str,int], list[tuple[Particle,int]]] = {}
+        # entries: (particle, src_cell_idx)
+        sink_arrivals: list[tuple[Particle, str, int]] = []
+
+        for src_node, dst_node, d in g.edges(data=True):
+            lbl = d["label"]
+            v_free = d["v_free_mps"]
+            cell_len = state.cell_len[lbl]
+            n_cells  = state.num_cells[lbl]
+            eff_lanes = state.effective_lanes.get(lbl, d["lanes"])
+
+            if eff_lanes == 0:
+                # Fully-closed edge: count delay but freeze positions.
+                stranded = sum(p.count for c in state.cells[lbl] for p in c)
+                state.cum_delay[lbl] += stranded * 1.0
+                continue
+
+            for ci in range(n_cells):
+                speed_motor  = _cell_speed(state, lbl, ci, v_free, cfg, motorcycle=True)
+                speed_other  = _cell_speed(state, lbl, ci, v_free, cfg, motorcycle=False)
+                still_here:  list[Particle] = []
+                for p in state.cells[lbl][ci]:
+                    speed = speed_motor if p.cls == "motorcycle" else speed_other
+                    p.pos_m += speed * 1.0
+                    if p.cls != "motorcycle" and speed < v_free:
+                        state.cum_delay[lbl] += p.count * (1.0 - speed / v_free)
+                    if p.pos_m >= cell_len:
+                        # Park at cell end; queue for transfer.
+                        p.pos_m = cell_len
+                        if ci + 1 < n_cells:
+                            intra_edge_arrivals.setdefault((lbl, ci + 1), []).append((p, ci))
+                        else:
+                            # Last cell → cross to next edge.
+                            next_lbl = _choose_next_edge(state, dst_node, p.cls,
+                                                         rng.random())
+                            if next_lbl is None:
+                                sink_arrivals.append((p, lbl, ci))
+                            else:
+                                if state.effective_lanes.get(next_lbl, 1) == 0:
+                                    # Reroute around closures.
+                                    fb = None
+                                    for _u, _v, dd in g.out_edges(dst_node, data=True):
+                                        if state.effective_lanes.get(dd["label"], dd["lanes"]) > 0:
+                                            fb = dd["label"]; break
+                                    if fb is None:
+                                        # Park at last cell — backpressure ripple.
+                                        still_here.append(p)
+                                        state.cum_delay[lbl] += p.count * 1.0
+                                        continue
+                                    next_lbl = fb
+                                edge_to_edge_arrivals.setdefault(next_lbl, []).append(
+                                    (p, lbl, ci)
+                                )
+                    else:
+                        still_here.append(p)
+                state.cells[lbl][ci] = still_here
+
+        # ── 4. Resolve intra-edge transfers (cell→cell) ────────────────
+        # Each receiving cell can accept up to (lanes × per_lane_acc) vehicles
+        # per second AND up to its remaining spatial slack.
+        #
+        # Process in reverse order (high cell idx first) so that when an
+        # earlier cell pushes into the cell we're currently filling, the
+        # downstream cell has already been resolved — preserves FIFO.
+        # Actually — we want to process earliest-arrival-first.  Since
+        # intra-edge transfers within a single second are independent
+        # (one cell pushes into one downstream), process them in order.
+        for (lbl, target_cell_idx), arrivals in intra_edge_arrivals.items():
+            _resolve_arrivals(
+                state, cfg, lbl, target_cell_idx, arrivals,
+                per_lane_acc=per_lane_acc, bp_threshold=bp_threshold,
+                source_edge_for_park=lbl,
+            )
+
+        # ── 5. Resolve edge-to-edge transfers (last cell of src → cell 0 of dst) ──
+        # At a merge node, multiple source edges feed the same dst edge.
+        # We aggregate them in arrival order so the per-second cap is shared
+        # — this realises the merge-bottleneck physics (item 3a).
+        for target_edge, arrivals in edge_to_edge_arrivals.items():
+            _resolve_edge_arrivals(
+                state, cfg, target_edge, arrivals,
+                per_lane_acc=per_lane_acc, bp_threshold=bp_threshold,
+            )
 
         # Sink arrivals — count them.
-        for p, src_lbl in sink_arrivals:
+        for p, src_lbl, _ci in sink_arrivals:
             state.exit_counts[src_lbl][p.cls] += p.count
 
-        # ── 5. Telemetry row per edge ────────────────────────────────────
+        # ── 6. Telemetry rows ──────────────────────────────────────────
         for u, v, d in g.edges(data=True):
             lbl = d["label"]
             length = d["length_m"]
-            occ_m = _occupancy_metres(state.particles[lbl], cfg)
-            max_m = max(length * state.effective_lanes.get(lbl, d["lanes"]), 1.0)
+            eff_lanes = state.effective_lanes.get(lbl, d["lanes"])
+            occ_m = _edge_total_occupancy(state, lbl, cfg)
+            max_m = max(length * eff_lanes, 1.0)
             ratio = min(occ_m / max_m, 1.0)
-            cars = sum(p.count for p in state.particles[lbl] if p.cls == "car")
-            hgvs = sum(p.count for p in state.particles[lbl] if p.cls == "hgv")
-            mots = sum(p.count for p in state.particles[lbl] if p.cls == "motorcycle")
+            cars = sum(p.count for c in state.cells[lbl] for p in c if p.cls == "car")
+            hgvs = sum(p.count for c in state.cells[lbl] for p in c if p.cls == "hgv")
+            mots = sum(p.count for c in state.cells[lbl] for p in c if p.cls == "motorcycle")
             v_free = d["v_free_mps"]
             v_now  = _greenshields_speed(v_free, ratio, cfg)
-            state.rows.append({
+            state.edge_rows.append({
                 "time_s":           t,
                 "edge":             lbl,
                 "occupancy_ratio":  round(ratio, 4),
@@ -518,25 +615,46 @@ def simulate(scenario: Scenario,
                 "hgv_on_edge":      hgvs,
                 "moto_on_edge":     mots,
                 "cumulative_delay": round(state.cum_delay[lbl], 2),
-                "effective_lanes":  state.effective_lanes.get(lbl, d["lanes"]),
+                "effective_lanes":  eff_lanes,
             })
 
-        # ── 6. Per-particle position log (Fix 1b / Fix 3) ────────────────
+            # Per-cell rows (used by the visualizer to render speed gradient)
+            for ci in range(state.num_cells[lbl]):
+                cell_max = _cell_max_m(state, lbl)
+                cell_occ = _cell_occupancy_metres(state.cells[lbl][ci], cfg)
+                cell_ratio = (cell_occ / cell_max) if cell_max > 0 else 1.0
+                cell_v = _greenshields_speed(v_free, cell_ratio, cfg)
+                state.cell_rows.append({
+                    "time_s":   t,
+                    "edge":     lbl,
+                    "cell_idx": ci,
+                    "ratio":    round(cell_ratio, 4),
+                    "speed_kph": round(cell_v * 3.6, 2),
+                    "n_cells":  state.num_cells[lbl],
+                })
+
+        # ── 7. Per-particle position log ──────────────────────────────
         if emit_particles:
             for u, v, d in g.edges(data=True):
-                lbl = d["label"]
+                lbl    = d["label"]
                 length = d["length_m"]
-                for p in state.particles[lbl]:
-                    particles_rows.append({
-                        "time_s":   t,
-                        "edge":     lbl,
-                        "cls":      p.cls,
-                        "count":    p.count,
-                        "pos_m":    round(p.pos_m, 2),
-                        "pos_frac": round(p.pos_m / max(length, 1.0), 4),
-                    })
+                cell_len = state.cell_len[lbl]
+                n_cells = state.num_cells[lbl]
+                for ci in range(n_cells):
+                    for p in state.cells[lbl][ci]:
+                        # Global position on edge
+                        pos_global = ci * cell_len + p.pos_m
+                        particles_rows.append({
+                            "time_s":   t,
+                            "edge":     lbl,
+                            "cls":      p.cls,
+                            "count":    p.count,
+                            "pos_m":    round(pos_global, 2),
+                            "pos_frac": round(pos_global / max(length, 1.0), 4),
+                            "cell_idx": ci,
+                        })
 
-    df = pd.DataFrame(state.rows)
+    df = pd.DataFrame(state.edge_rows)
     particles_df = pd.DataFrame(particles_rows) if emit_particles else pd.DataFrame()
 
     exit_total = 0
@@ -546,6 +664,9 @@ def simulate(scenario: Scenario,
     for lbl in g.graph.get("escape_edges", []):
         escape_total += sum(state.exit_counts.get(lbl, {}).values())
 
+    queued_total = sum(p.count for q in state.source_queue.values() for p in q)
+    in_network_total = sum(p.count for cells in state.cells.values()
+                           for c in cells for p in c)
     summary = {
         "network":           scenario.network_key,
         "direction":         scenario.direction,
@@ -553,7 +674,150 @@ def simulate(scenario: Scenario,
         "variant":           scenario.variant,
         "exit_total":        exit_total,
         "escape_total":      escape_total,
+        "queued_at_entry":   queued_total,
+        "still_in_network":  in_network_total,
         "total_delay_veh_s": round(sum(state.cum_delay.values()), 2),
         "scaling_applied":   round(scaling, 4),
     }
     return df, particles_df, summary
+
+
+# ---------------------------------------------------------------------------
+# Capacity-capped transfer helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_arrivals(state: _EngineState, cfg: dict,
+                      target_edge: str, target_cell_idx: int,
+                      arrivals: list[tuple[Particle, int]],
+                      *, per_lane_acc: float, bp_threshold: float,
+                      source_edge_for_park: str) -> None:
+    """
+    Resolve particles wanting to enter cell `target_cell_idx` of `target_edge`.
+    Source is the previous cell of the same edge.
+    """
+    """
+    Intra-edge cell→cell transfer.
+    Free movement below the backpressure threshold; capped by spatial slack
+    only above it. Cell-traversal time on the source already paces arrivals
+    so no per-second budget is needed at this scale.
+    """
+    eff_lanes = state.effective_lanes.get(target_edge, 0)
+    if eff_lanes == 0:
+        for p, src_ci in arrivals:
+            cell_len_src = state.cell_len[source_edge_for_park]
+            state.cells[source_edge_for_park][src_ci].append(
+                Particle(cls=p.cls, count=p.count, pos_m=cell_len_src)
+            )
+            state.cum_delay[target_edge] += p.count * 1.0
+        return
+
+    cell_max_m = _cell_max_m(state, target_edge)
+    cell_used  = _cell_occupancy_metres(state.cells[target_edge][target_cell_idx], cfg)
+    cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+    available_m = max(cell_max_m - cell_used, 0.0)
+
+    for p, src_ci in arrivals:
+        veh_cfg = cfg["vehicles"].get(p.cls, {})
+        len_per = veh_cfg.get("length_m", 0.0)
+        contributes = veh_cfg.get("contributes_to_occupancy", False)
+
+        if (not contributes) or (cell_ratio < bp_threshold):
+            state.cells[target_edge][target_cell_idx].append(
+                Particle(cls=p.cls, count=p.count, pos_m=0.0)
+            )
+            if contributes:
+                cell_used += p.count * len_per
+                available_m = max(cell_max_m - cell_used, 0.0)
+                cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+            continue
+
+        max_by_space = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
+        accept_n = max(min(p.count, max_by_space), 0)
+        if accept_n > 0:
+            state.cells[target_edge][target_cell_idx].append(
+                Particle(cls=p.cls, count=accept_n, pos_m=0.0)
+            )
+            cell_used += accept_n * len_per
+            available_m = max(cell_max_m - cell_used, 0.0)
+            cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+        rejected = p.count - accept_n
+        if rejected > 0:
+            cell_len_src = state.cell_len[source_edge_for_park]
+            state.cells[source_edge_for_park][src_ci].append(
+                Particle(cls=p.cls, count=rejected, pos_m=cell_len_src)
+            )
+            state.cum_delay[source_edge_for_park] += rejected * 1.0
+
+
+def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
+                           target_edge: str,
+                           arrivals: list[tuple[Particle, str, int]],
+                           *, per_lane_acc: float, bp_threshold: float) -> None:
+    """
+    Resolve particles wanting to cross from various source edges into cell 0
+    of `target_edge`. At a merge node, both source edges feed the same target
+    so they share a single per-second acceptance budget — natural merge
+    bottleneck (item 3a).
+    """
+    """
+    Edge→edge transfer (last cell of source → cell 0 of target).
+
+    Below the backpressure threshold: free transfer (cell-traversal time on
+    the source edge already paces arrivals naturally). Above the threshold,
+    transfers are capped by remaining spatial slack on the target's first
+    cell. When the trunk's first cell saturates, two inflow edges both lose
+    capacity to push in — that's the merge bottleneck (item 3a).
+
+    Motorcycles always pass through (queue-filtering).
+    """
+    eff_lanes = state.effective_lanes.get(target_edge, 0)
+    if eff_lanes == 0:
+        for p, src_lbl, src_ci in arrivals:
+            src_cell_len = state.cell_len[src_lbl]
+            state.cells[src_lbl][src_ci].append(
+                Particle(cls=p.cls, count=p.count, pos_m=src_cell_len)
+            )
+            state.cum_delay[src_lbl] += p.count * 1.0
+        return
+
+    cell_max_m = _cell_max_m(state, target_edge)
+    cell_used  = _cell_occupancy_metres(state.cells[target_edge][0], cfg)
+    cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+    available_m = max(cell_max_m - cell_used, 0.0)
+
+    for p, src_lbl, src_ci in arrivals:
+        veh_cfg = cfg["vehicles"].get(p.cls, {})
+        len_per = veh_cfg.get("length_m", 0.0)
+        contributes = veh_cfg.get("contributes_to_occupancy", False)
+
+        if not contributes:
+            state.cells[target_edge][0].append(
+                Particle(cls=p.cls, count=p.count, pos_m=0.0)
+            )
+            continue
+
+        if cell_ratio < bp_threshold:
+            state.cells[target_edge][0].append(
+                Particle(cls=p.cls, count=p.count, pos_m=0.0)
+            )
+            cell_used += p.count * len_per
+            available_m = max(cell_max_m - cell_used, 0.0)
+            cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+            continue
+
+        max_by_space = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
+        accept_n = max(min(p.count, max_by_space), 0)
+        if accept_n > 0:
+            state.cells[target_edge][0].append(
+                Particle(cls=p.cls, count=accept_n, pos_m=0.0)
+            )
+            cell_used += accept_n * len_per
+            available_m = max(cell_max_m - cell_used, 0.0)
+            cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
+        rejected = p.count - accept_n
+        if rejected > 0:
+            src_cell_len = state.cell_len[src_lbl]
+            state.cells[src_lbl][src_ci].append(
+                Particle(cls=p.cls, count=rejected, pos_m=src_cell_len)
+            )
+            state.cum_delay[src_lbl] += rejected * 1.0
