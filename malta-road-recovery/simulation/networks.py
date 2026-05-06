@@ -119,7 +119,10 @@ def build_rsb() -> nx.DiGraph:
     g.graph["inflow_edges"]   = ["flyover_S", "underpass_S"]
     g.graph["exit_edges"]     = ["mainway_S"]
     g.graph["escape_edges"]   = ["escape_S"]
-    g.graph["closeable_edge"] = "mergeway_S"   # the edge whose lanes get closed
+    # Closures act on the post-diverge Main Way only — never the trunk and
+    # never the escape. That way the escape route stays available and
+    # vehicles can peel off to it as the Main Way saturates.
+    g.graph["closeable_edge"] = "mainway_S"
     return g
 
 
@@ -168,7 +171,9 @@ def build_rnb() -> nx.DiGraph:
     g.graph["inflow_edges"]   = ["mergeway_N_a", "underpass_N"]
     g.graph["exit_edges"]     = ["mainway_N"]
     g.graph["escape_edges"]   = ["escape_N"]
-    g.graph["closeable_edge"] = "mergeway_N_b"
+    # Closure acts on the post-diverge Main Way only — the trunk stays open
+    # so the diverge node remains reachable and traffic can peel off to escape.
+    g.graph["closeable_edge"] = "mainway_N"
     return g
 
 

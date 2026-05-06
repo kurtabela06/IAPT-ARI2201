@@ -2,9 +2,9 @@
   "direction": "regional_south",
   "slot": "1pm",
   "manual_total": 394,
-  "scaling": 1.9883,
-  "injected_total": 788,
-  "simulated_exit": 228,
-  "iterations": 40,
-  "match_pct": 42.132
+  "scaling": 1.0156,
+  "injected_total": 398,
+  "simulated_exit": 398,
+  "iterations": 5,
+  "match_pct": 1.015
 }

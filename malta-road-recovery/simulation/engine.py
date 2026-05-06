@@ -88,9 +88,21 @@ _DEFAULT_CFG = {
                                      # from edge length / cell_length_m.
         "per_lane_acceptance_per_s": 0.6,   # ≈ 2160 veh/hr/lane saturation
     },
-    "diversion":    {"saturation_threshold": 0.80,
-                     "weight_growth_k":     8.0,
-                     "max_divert_share":    0.40},
+    "diversion":    {
+        # Piecewise diversion-share schedule, as a function of Main Way
+        # whole-edge occupancy ratio:
+        #   ratio ≤ saturation_threshold  → baseline_share
+        #   saturation_threshold < ratio < 1.0  → linear interp baseline → max
+        #   ratio ≥ 1.0  → max_divert_share
+        # The baseline (5–10 %) accounts for local traffic that always exits
+        # via the escape regardless of mainline conditions.
+        "baseline_share":         0.07,    # 7 % "local exiters" at all_open
+        "saturation_threshold":   0.80,    # ratio at which scaling kicks in
+        "max_divert_share":       0.40,    # cap at heavy congestion
+        # Legacy weight-growth_k is retained for the no-escape multi-edge
+        # case (inverse-weight distribution at non-escape diverges).
+        "weight_growth_k":        8.0,
+    },
     "backpressure": {"downstream_threshold": 0.90},
 }
 
@@ -223,26 +235,14 @@ def _choose_next_edge(state: _EngineState, node: str, cls: str,
         return out_edges[0][2]["label"]
 
     diversion_cfg = state.cfg["diversion"]
-    threshold = diversion_cfg["saturation_threshold"]
-    growth_k  = diversion_cfg["weight_growth_k"]
-    max_div   = diversion_cfg["max_divert_share"]
+    threshold      = diversion_cfg["saturation_threshold"]
+    baseline_share = diversion_cfg.get("baseline_share", 0.07)
+    max_div        = diversion_cfg["max_divert_share"]
+    growth_k       = diversion_cfg["weight_growth_k"]
 
-    base_weights: list[tuple[str, float]] = []
-    for _u, _v, d in out_edges:
-        lbl = d["label"]
-        cap_inv = 1.0 / max(d["max_occupancy_m"], 1.0)
-        edge_max = _edge_max_m(state, lbl, d)
-        if edge_max <= 0:
-            weight = float("inf")
-        else:
-            edge_occ = _edge_total_occupancy(state, lbl, state.cfg)
-            ratio = edge_occ / edge_max
-            overflow = max(0.0, ratio - threshold)
-            weight = cap_inv * math.exp(min(growth_k * overflow, 50.0))
-        base_weights.append((lbl, weight))
-
-    main_lbl = None
+    main_lbl   = None
     escape_lbl = None
+    main_d     = None    # edge data for the Main Way
     main_score = math.inf
     for _u, _v, d in out_edges:
         if d.get("is_escape"):
@@ -251,29 +251,62 @@ def _choose_next_edge(state: _EngineState, node: str, cls: str,
             cap_inv = 1.0 / max(d["max_occupancy_m"], 1.0)
             if cap_inv < main_score:
                 main_score = cap_inv
-                main_lbl = d["label"]
+                main_lbl   = d["label"]
+                main_d     = d
 
+    # Motorcycles always pick the Main Way (queue-filtering — they don't
+    # divert because they aren't slowed by the queue).
     if cls == "motorcycle" and main_lbl is not None:
         return main_lbl
 
+    # No escape route at this diverge — fall back to inverse-capacity weights.
     if escape_lbl is None:
-        total = sum(1.0 / w for _, w in base_weights)
+        weights = []
+        for _u, _v, d in out_edges:
+            cap_inv = 1.0 / max(d["max_occupancy_m"], 1.0)
+            edge_max = _edge_max_m(state, d["label"], d)
+            if edge_max <= 0:
+                weights.append((d["label"], float("inf")))
+                continue
+            edge_occ = _edge_total_occupancy(state, d["label"], state.cfg)
+            ratio = edge_occ / edge_max
+            overflow = max(0.0, ratio - threshold)
+            weights.append(
+                (d["label"], cap_inv * math.exp(min(growth_k * overflow, 50.0)))
+            )
+        total = sum(1.0 / w for _, w in weights if w != float("inf")) or 1.0
         cum = 0.0
-        for lbl, w in base_weights:
+        for lbl, w in weights:
+            if w == float("inf"):
+                continue
             cum += (1.0 / w) / total
             if rng_share <= cum:
                 return lbl
-        return base_weights[-1][0]
+        return weights[-1][0]
 
-    main_w   = next(w for lbl, w in base_weights if lbl == main_lbl)
-    escape_w = next(w for lbl, w in base_weights if lbl == escape_lbl)
-    if main_w == float("inf"):
+    # Escape exists — compute the diversion share from Main Way occupancy.
+    if main_lbl is None or main_d is None:
         return escape_lbl
-    if main_w <= escape_w:
-        return main_lbl
-    raw_share = (main_w - escape_w) / (main_w + escape_w)
-    divert_share = min(raw_share, max_div)
-    return escape_lbl if rng_share < divert_share else main_lbl
+    main_max = _edge_max_m(state, main_lbl, main_d)
+    if main_max <= 0:
+        # Main Way has no capacity (closure with lanes=0). Free-flow area
+        # under the curve is exhausted; the diversion share is the cap.
+        # Some traffic still picks Main and gets stranded — that's the
+        # spec's desired "red pile-up at end of Main Way" behaviour.
+        ratio = 1.0
+    else:
+        ratio = _edge_total_occupancy(state, main_lbl, state.cfg) / main_max
+
+    if ratio <= threshold:
+        share = baseline_share
+    elif ratio >= 1.0:
+        share = max_div
+    else:
+        # Linear interp from baseline_share at threshold → max_div at ratio=1.
+        t = (ratio - threshold) / (1.0 - threshold)
+        share = baseline_share + (max_div - baseline_share) * t
+    share = max(0.0, min(share, 1.0))
+    return escape_lbl if rng_share < share else main_lbl
 
 
 # ---------------------------------------------------------------------------
@@ -534,24 +567,17 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
                         if ci + 1 < n_cells:
                             intra_edge_arrivals.setdefault((lbl, ci + 1), []).append((p, ci))
                         else:
-                            # Last cell → cross to next edge.
+                            # Last cell → cross to next edge. Routing chooses
+                            # between Main Way and Escape (or sole successor).
+                            # No forced reroute around closures: if the
+                            # diversion picks a closed edge, the receiving
+                            # cell will reject the transfer and the particle
+                            # is parked on the source cell (red pile-up).
                             next_lbl = _choose_next_edge(state, dst_node, p.cls,
                                                          rng.random())
                             if next_lbl is None:
                                 sink_arrivals.append((p, lbl, ci))
                             else:
-                                if state.effective_lanes.get(next_lbl, 1) == 0:
-                                    # Reroute around closures.
-                                    fb = None
-                                    for _u, _v, dd in g.out_edges(dst_node, data=True):
-                                        if state.effective_lanes.get(dd["label"], dd["lanes"]) > 0:
-                                            fb = dd["label"]; break
-                                    if fb is None:
-                                        # Park at last cell — backpressure ripple.
-                                        still_here.append(p)
-                                        state.cum_delay[lbl] += p.count * 1.0
-                                        continue
-                                    next_lbl = fb
                                 edge_to_edge_arrivals.setdefault(next_lbl, []).append(
                                     (p, lbl, ci)
                                 )

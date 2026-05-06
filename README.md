@@ -124,9 +124,10 @@ Configurable via `config/simulation.yaml`:
 | `engine.cell_length_m`                      | 100.0      |
 | `engine.per_lane_acceptance_per_s`          | 0.6        |
 | `backpressure.downstream_threshold`         | 0.90       |
+| `diversion.baseline_share`                  | 0.07       |
 | `diversion.saturation_threshold`            | 0.80       |
-| `diversion.weight_growth_k`                 | 8.0        |
 | `diversion.max_divert_share`                | 0.40       |
+| `diversion.weight_growth_k`                 | 8.0        |
 
 ### Demand calibration (Q4 — fixed-injection rule)
 
@@ -203,17 +204,52 @@ Each second the engine performs a two-pass update **per cell**:
    rather than a sudden burst. Largest-remainder rounding preserves bin
    totals exactly.
 
-### Dynamic diversion (Q3 — Pressure-Valve)
+### Closures act on the Main Way only
 
-When an edge's spatial occupancy crosses `saturation_threshold` (default
-80 %), upstream diverge nodes inflate that edge's routing weight
-exponentially. Vehicles probabilistically divert to the escape route until
-the queue clears. On Valley Eastbound the same mechanism realises the
-**Naxxar Road Pressure-Valve** diversion.
+Closures (`1_lane_closed`, `2_lanes_closed`, `full_closure`) reduce
+`effective_lanes` strictly on the **post-diverge Main Way** edge — never the
+trunk and never the escape. That keeps the diverge node reachable so traffic
+can peel off to the escape route while the Main Way fills with stranded cars.
+Per network:
 
-If an edge is hard-closed (`effective_lanes = 0`), routing diverts 100 % of
-flow regardless of the `max_divert_share` cap. Motorcycles never divert
-(queue-filtering).
+| Network | Closeable edge | Reduces lanes |
+| --- | --- | --- |
+| RNB | `mainway_N`     | 2 → 1 / 0 |
+| RSB | `mainway_S`     | 2 → 1 / 0 |
+| VEB | `valley_cont_E` | 1 → 0     |
+| VWB | `valley_W_post` | 1 → 0 (no escape route exists) |
+
+### Dynamic diversion (Pressure-Valve, three-stage curve)
+
+The diversion share at each diverge node is a piecewise function of the
+**Main Way's whole-edge occupancy ratio** `ρ`:
+
+```
+Stage 1  (Normal)        ρ ≤ 0.80           share = 0.07         (5–10 % "local exiters")
+Stage 2  (Queue forming) 0.80 < ρ < 1.00    share = linear interp 0.07 → 0.40
+Stage 3  (High pressure) ρ ≥ 1.00           share = 0.40         (cap)
+```
+
+Default knobs (`config/simulation.yaml`):
+- `diversion.baseline_share = 0.07`
+- `diversion.saturation_threshold = 0.80`
+- `diversion.max_divert_share = 0.40`
+
+This single curve drives **all** escape diversion across the four networks:
+RNB/RSB escape ramps, the Naxxar Road Pressure-Valve on VEB. Motorcycles
+always pick the Main Way (queue-filtering — they don't experience the jam).
+
+**Why no forced-reroute around closed edges**: when the Main Way is closed
+(`effective_lanes = 0`), routing still picks Main vs Escape per the curve
+above. Particles that pick the closed Main Way park on the trunk's last cell
+and back-pressure ripples upstream. As Main Way occupancy stays at 100 %,
+the diversion share is pinned at 40 %, so a continuous **40 % stream of
+arrivals peels off to the escape** — exactly the spec's "red pile-up at end
+of Main Way + steady stream of orange/green dots through the escape."
+
+This produces the right visual: Main Way red and saturated; Escape running
+green/orange continuously; trunk and inflows orange/red as backpressure
+builds.
 
 ### The 30-scenario grid (Q6 — restricted to filmed slots)
 
