@@ -1,23 +1,35 @@
 """
 simulation/scenarios.py
 =======================
-Pre-compute the 120-scenario synthetic dataset.
+Pre-compute the synthetic scenario library.
 
-Grid:
-    4 directions × 12 time slots × variants
-        regional: 3 variants  (all_open, 1_lane_closed, 2_lanes_closed)
-        valley:   2 variants  (all_open, 1_lane_closed)
-    → 4 × 12 × (3 or 2) = 12 × (3+3+2+2) = 120 scenarios
+The CLI hierarchy (Q4 of this round):
 
-Each scenario produces:
-    data/synthetic/scenarios/<direction>_<slot>_<variant>.csv
-        — telemetry: one row per (sim_second × edge)
-    data/synthetic/scenarios/<direction>_<slot>_<variant>.json
-        — summary: exit count, escape count, total delay, scaling, recovery flag
+    Level 1: Direction         (regional_north / regional_south / valley_east / valley_west)
+    Level 2: Time slot         (10am / 1pm / 5pm)
+    Level 3: Base horizon H    (600 / 900 / 1200 s)
+    Level 4: Mode              (closure_only / closure_plus_recovery)
+    Level 5: Transition        (regional only — 2_to_1 / 2_to_0)
 
-The batch runner uses the calibrated `injection_count` (Q4) so each variant
-has the **same** demand pulse — only the closure differs. That's how we
-isolate "Recovery Time" as a learnable target.
+For mode = closure_only the run lasts H seconds. For mode = closure_plus_recovery
+the run lasts 2H seconds: closure-from-the-start, then a lane-swap (the chosen
+"transition") at t = H. Demand is looped from the manual CSV — so a 1800 s
+recovery run cycles through the 10 manual bins ~3 times.
+
+Cache layout (duration-specific subfolders):
+
+    data/synthetic/scenarios/
+        600s/<scenario>.{csv, json, particles.csv}
+        900s/<scenario>.{csv, json, particles.csv}
+        1200s/<scenario>.{csv, json, particles.csv}
+        1800s/<scenario>.{csv, json, particles.csv}    (recovery from H=900)
+        2400s/<scenario>.{csv, json, particles.csv}    (recovery from H=1200)
+        1200s_recovery/<scenario>.{csv, …}             (recovery from H=600)
+
+Scenario IDs use the canonical `<direction>_<slot>_<H>s_<mode>_<transition>` form,
+e.g.  regional_south_5pm_600s_closure_only_1_lane_closed
+      regional_south_5pm_600s_recovery_2_to_1
+      valley_east_5pm_900s_recovery
 """
 
 from __future__ import annotations
@@ -34,117 +46,228 @@ PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
 
-from simulation.engine import Scenario, simulate, load_engine_config
+from simulation.engine import Scenario, RecoveryPolicy, simulate, load_engine_config
 from simulation.networks import DIRECTION_TO_NETWORK
 from simulation.calibrator import calibrate_injection, scaled_pulses
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SCN_DIR      = PROJECT_ROOT / "data" / "synthetic" / "scenarios"
-SCN_DIR.mkdir(parents=True, exist_ok=True)
+SCN_ROOT     = PROJECT_ROOT / "data" / "synthetic" / "scenarios"
+SCN_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Slots to simulate — strictly the three time-slots we filmed in the field.
-# No interpolation, no synthetic slots.
-TIME_SLOTS = ("10am", "1pm", "5pm")
+TIME_SLOTS    = ("10am", "1pm", "5pm")
+BASE_HORIZONS = (600, 900, 1200)               # H values offered by the CLI
+DIRECTIONS    = list(DIRECTION_TO_NETWORK.keys())
 
-REGIONAL_VARIANTS = ("all_open", "1_lane_closed", "2_lanes_closed")
-VALLEY_VARIANTS   = ("all_open", "1_lane_closed")
+# Mode labels.
+MODE_CLOSURE_ONLY = "closure_only"
+MODE_RECOVERY     = "recovery"
 
-DIRECTIONS = list(DIRECTION_TO_NETWORK.keys())
+# For Mode B (recovery), the transition is the closure→recovery state pair.
+# Format: (closure_variant, new_lane_count_after_recovery)
+REGIONAL_TRANSITIONS = {
+    "2_to_1": ("2_lanes_closed", 1),   # closure 2L→0, recovery to 1 lane
+    "2_to_0": ("2_lanes_closed", 0),   # closure 2L→0, recovery to 0 lanes (still closed)
+    "1_to_2": ("1_lane_closed",  2),   # closure 2L→1, recovery to full 2 lanes
+}
+# For valley (single-lane), only one transition makes physical sense:
+VALLEY_TRANSITIONS = {
+    "1_to_1": ("1_lane_closed",  1),   # closure 1L→0, recovery to 1 lane (full reopen)
+}
+
+# Closure variants for Mode A (closure-only previews):
+REGIONAL_CLOSURE_VARIANTS = ("all_open", "1_lane_closed", "2_lanes_closed")
+VALLEY_CLOSURE_VARIANTS   = ("all_open", "1_lane_closed")
 
 
-def variants_for(direction: str) -> tuple[str, ...]:
-    return REGIONAL_VARIANTS if "regional" in direction else VALLEY_VARIANTS
+def transitions_for(direction: str) -> dict[str, tuple[str, int]]:
+    return REGIONAL_TRANSITIONS if "regional" in direction else VALLEY_TRANSITIONS
 
 
-def output_paths(direction: str, slot: str, variant: str) -> tuple[Path, Path, Path]:
-    """Return (telemetry_csv, summary_json, particles_csv)."""
-    csv  = SCN_DIR / f"{direction}_{slot}_{variant}.csv"
-    js   = SCN_DIR / f"{direction}_{slot}_{variant}.json"
-    pcsv = SCN_DIR / f"{direction}_{slot}_{variant}.particles.csv"
-    return csv, js, pcsv
+def closure_variants_for(direction: str) -> tuple[str, ...]:
+    return REGIONAL_CLOSURE_VARIANTS if "regional" in direction else VALLEY_CLOSURE_VARIANTS
 
 
-def run_one(direction: str, slot: str, variant: str,
+# ---------------------------------------------------------------------------
+# Path helpers — duration-specific subfolders
+# ---------------------------------------------------------------------------
+
+def _scenario_id(direction: str, slot: str, mode: str,
+                 variant_or_transition: str) -> str:
+    return f"{direction}_{slot}_{variant_or_transition}_{mode}"
+
+
+def output_paths(direction: str, slot: str, base_h: int, mode: str,
+                 variant_or_transition: str) -> tuple[Path, Path, Path]:
+    """
+    Return (telemetry_csv, summary_json, particles_csv) inside the
+    duration-specific subfolder. Subfolder name = total horizon used:
+       closure_only        → <H>s/
+       closure_plus_recovery → <2H>s/
+    """
+    total_h = base_h if mode == MODE_CLOSURE_ONLY else 2 * base_h
+    sub = SCN_ROOT / f"{total_h}s"
+    sub.mkdir(parents=True, exist_ok=True)
+    sid = _scenario_id(direction, slot, mode, variant_or_transition)
+    return sub / f"{sid}.csv", sub / f"{sid}.json", sub / f"{sid}.particles.csv"
+
+
+# ---------------------------------------------------------------------------
+# Scenario builder
+# ---------------------------------------------------------------------------
+
+def _build_scenario(direction: str, slot: str, base_h: int, mode: str,
+                    variant_or_transition: str) -> Scenario:
+    """Construct a Scenario object from the hierarchical selection."""
+    calib = calibrate_injection(direction, slot, verbose=False)
+    scaling = calib["scaling"]
+    pulses = scaled_pulses(direction, slot, scaling)
+    injection = calib["injected_total"]
+
+    if mode == MODE_CLOSURE_ONLY:
+        return Scenario(
+            network_key=DIRECTION_TO_NETWORK[direction],
+            direction=direction, slot=slot, variant=variant_or_transition,
+            pulses=pulses, injection_count=injection,
+            horizon_s=base_h,
+            base_horizon_s=base_h,
+        )
+
+    # MODE_RECOVERY
+    transitions = transitions_for(direction)
+    if variant_or_transition not in transitions:
+        raise ValueError(
+            f"Invalid transition '{variant_or_transition}' for {direction}. "
+            f"Available: {list(transitions)}"
+        )
+    closure_variant, recovery_lanes = transitions[variant_or_transition]
+    return Scenario(
+        network_key=DIRECTION_TO_NETWORK[direction],
+        direction=direction, slot=slot, variant=closure_variant,
+        pulses=pulses, injection_count=injection,
+        horizon_s=2 * base_h,
+        base_horizon_s=base_h,
+        recovery=RecoveryPolicy(start_s=base_h, new_lane_count=recovery_lanes),
+        transition_label=_transition_label(variant_or_transition, closure_variant, recovery_lanes),
+    )
+
+
+def _transition_label(transition_key: str, closure_variant: str, recovery_lanes: int) -> str:
+    pretty = {
+        "2_to_1":  "Recovery: 2 lanes closed → 1 lane reopens",
+        "2_to_0":  "Recovery: 2 lanes closed → still 0 lanes",
+        "1_to_2":  "Recovery: 1 lane closed → fully reopened",
+        "1_to_1":  "Recovery: 1-lane road reopens",
+    }
+    return pretty.get(transition_key, f"Recovery → {recovery_lanes} lanes")
+
+
+# ---------------------------------------------------------------------------
+# Scenario runner
+# ---------------------------------------------------------------------------
+
+def run_one(direction: str, slot: str, base_h: int, mode: str,
+            variant_or_transition: str,
             *, force: bool = False, verbose: bool = False) -> dict:
-    """Run a single scenario, persist telemetry + particles + summary."""
-    csv_p, json_p, pcsv_p = output_paths(direction, slot, variant)
+    """Run one (direction, slot, H, mode, variant_or_transition) scenario."""
+    csv_p, json_p, pcsv_p = output_paths(direction, slot, base_h, mode, variant_or_transition)
     if csv_p.exists() and json_p.exists() and pcsv_p.exists() and not force:
         if verbose:
-            print(f"  [scn] {direction}/{slot}/{variant}: cached")
+            print(f"  [scn] {csv_p.parent.name}/{csv_p.stem}: cached")
         return json.loads(json_p.read_text())
 
-    manual_slot = slot          # slots == manual slots now (Fix 2)
-    calib = calibrate_injection(direction, manual_slot, verbose=False)
-    scaling = calib["scaling"]
-    pulses = scaled_pulses(direction, manual_slot, scaling)
-    injection_count = calib["injected_total"]
-
-    sc = Scenario(
-        network_key=DIRECTION_TO_NETWORK[direction],
-        direction=direction, slot=slot, variant=variant,
-        pulses=pulses, injection_count=injection_count,
-    )
+    sc = _build_scenario(direction, slot, base_h, mode, variant_or_transition)
     cfg = load_engine_config()
     df, particles_df, summary = simulate(sc, cfg=cfg)
 
     df.to_csv(csv_p, index=False)
     particles_df.to_csv(pcsv_p, index=False)
-    summary["manual_slot"]      = manual_slot
-    summary["calibration_scl"]  = scaling
-    summary["injection_count"]  = injection_count
+    summary["manual_slot"]      = slot
+    summary["base_horizon_s"]   = base_h
+    summary["mode"]             = mode
+    summary["variant_or_transition"] = variant_or_transition
+    summary["injection_count"]  = sc.injection_count
+    summary["calibration_scl"]  = (sc.injection_count / sum(p["car"]+p["hgv"]+p["motorcycle"]
+                                                            for p in sc.pulses) ) if sc.pulses else 1.0
     json_p.write_text(json.dumps(summary, indent=2))
 
     if verbose:
-        print(f"  [scn] {direction}/{slot}/{variant}: "
+        rec = summary.get("recovery_time_s")
+        rec_str = f"  recovery={rec}s" if rec is not None else ""
+        print(f"  [scn] {csv_p.parent.name}/{csv_p.stem}: "
               f"exit={summary['exit_total']}  escape={summary['escape_total']}  "
-              f"delay={summary['total_delay_veh_s']}")
+              f"delay={summary['total_delay_veh_s']:.0f}{rec_str}")
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Bulk runner — all combinations
+# ---------------------------------------------------------------------------
+
+def iterate_grid():
+    """Yield every (direction, slot, base_h, mode, variant_or_transition) combo."""
+    for direction in DIRECTIONS:
+        for slot in TIME_SLOTS:
+            for base_h in BASE_HORIZONS:
+                # Mode A (closure_only) → all standard closure variants
+                for v in closure_variants_for(direction):
+                    yield direction, slot, base_h, MODE_CLOSURE_ONLY, v
+                # Mode B (recovery) → every transition supported by this network
+                for t_key in transitions_for(direction):
+                    yield direction, slot, base_h, MODE_RECOVERY, t_key
 
 
 def run_all(*, force: bool = False, verbose: bool = True) -> list[dict]:
     summaries = []
-    total = sum(len(variants_for(d)) for d in DIRECTIONS) * len(TIME_SLOTS)
-    n = 0
-    for direction in DIRECTIONS:
-        for slot in TIME_SLOTS:
-            for variant in variants_for(direction):
-                n += 1
-                if verbose:
-                    print(f"\n[{n:3d}/{total}] {direction} / {slot} / {variant}")
-                summaries.append(run_one(direction, slot, variant,
-                                         force=force, verbose=verbose))
+    grid = list(iterate_grid())
+    total = len(grid)
+    for i, (direction, slot, base_h, mode, vot) in enumerate(grid, 1):
+        if verbose:
+            print(f"\n[{i:3d}/{total}] {direction} / {slot} / H={base_h}s / {mode} / {vot}")
+        summaries.append(run_one(direction, slot, base_h, mode, vot,
+                                 force=force, verbose=verbose))
     if verbose:
-        print(f"\n[scn] {len(summaries)} scenarios written to {SCN_DIR}")
+        print(f"\n[scn] {len(summaries)} scenarios written under {SCN_ROOT}")
     return summaries
 
 
 def list_scenarios() -> pd.DataFrame:
-    """Tabulate every cached scenario summary."""
+    """Tabulate every cached scenario summary across all duration subfolders."""
     rows = []
-    for js in sorted(SCN_DIR.glob("*.json")):
+    for js in sorted(SCN_ROOT.glob("*/*.json")):
         rows.append(json.loads(js.read_text()))
     return pd.DataFrame(rows)
 
 
+def count_scenarios() -> int:
+    return len(list(SCN_ROOT.glob("*/*.json")))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pre-compute scenario grid")
-    parser.add_argument("--all", action="store_true", help="Run the full 120-scenario grid")
+    parser.add_argument("--all", action="store_true",
+                        help="Run every combination in the hierarchy")
     parser.add_argument("--direction", choices=DIRECTIONS)
-    parser.add_argument("--slot")
-    parser.add_argument("--variant")
-    parser.add_argument("--force", action="store_true", help="Recompute even if cache exists")
+    parser.add_argument("--slot",      choices=TIME_SLOTS)
+    parser.add_argument("--base-h",    type=int, choices=BASE_HORIZONS)
+    parser.add_argument("--mode",      choices=(MODE_CLOSURE_ONLY, MODE_RECOVERY))
+    parser.add_argument("--variant-or-transition",
+                        help="Closure variant (Mode A) or transition key (Mode B)")
+    parser.add_argument("--force", action="store_true",
+                        help="Recompute even if cache exists")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
     verbose = not args.quiet
     if args.all:
         run_all(force=args.force, verbose=verbose)
-    elif args.direction and args.slot and args.variant:
-        s = run_one(args.direction, args.slot, args.variant,
-                    force=args.force, verbose=verbose)
-        print(json.dumps(s, indent=2))
-    else:
-        parser.error("Use --all, or supply --direction --slot --variant")
+        return
+    if not (args.direction and args.slot and args.base_h
+            and args.mode and args.variant_or_transition):
+        parser.error("Use --all, or supply --direction --slot --base-h --mode "
+                     "--variant-or-transition")
+    s = run_one(args.direction, args.slot, args.base_h, args.mode,
+                args.variant_or_transition, force=args.force, verbose=verbose)
+    print(json.dumps(s, indent=2))
 
 
 if __name__ == "__main__":

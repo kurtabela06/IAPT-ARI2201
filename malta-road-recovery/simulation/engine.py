@@ -112,6 +112,25 @@ _DEFAULT_CFG = {
         # i.e. 50 % of the *original* free-flow throughput by default.
         "partial_throughput_factor": 0.5,
     },
+    # ─── Transition Penalty (global merge friction) ────────────────────
+    # For the first `merge_zone_m` metres of any edge whose source node has
+    # 2 or more inbound edges (a real merge), cell speed is multiplied by a
+    # factor drawn uniformly from [`speed_factor_min`, `speed_factor_max`].
+    # The factor is sampled once per cell per scenario for determinism.
+    "merge_friction": {
+        "merge_zone_m":      30.0,
+        "speed_factor_min":  0.70,
+        "speed_factor_max":  0.80,
+    },
+    # ─── Recovery thresholds ───────────────────────────────────────────
+    # Rolling-average network speed (km/h) above which the network is
+    # considered "recovered" after a closure is lifted. The engine reports
+    # `recovered_at_s` in the summary based on these thresholds.
+    "recovery": {
+        "rolling_window_s":      30,
+        "regional_threshold_kph": 60.0,
+        "valley_threshold_kph":   45.0,
+    },
 }
 
 
@@ -128,6 +147,18 @@ class Particle:
 
 
 @dataclass
+class RecoveryPolicy:
+    """
+    Mid-simulation lane-count change. When `start_s` is reached, the engine
+    swaps the closeable edge's `effective_lanes` from the closure state to
+    `new_lane_count`. Use new_lane_count = original_lanes for full reopen,
+    or some intermediate value to model a partial reopen (e.g. 2→1).
+    """
+    start_s:         int
+    new_lane_count:  int
+
+
+@dataclass
 class Scenario:
     network_key:     str
     direction:       str
@@ -135,6 +166,20 @@ class Scenario:
     variant:         str
     pulses:          list[dict]
     injection_count: Optional[int] = None
+    # Optional override for the simulation horizon. If None, the engine uses
+    # `engine.horizon_s` from config (default 600). Spec allows extended
+    # horizons of 1200, 1800, 2400 (= 2H for closure-and-recovery runs).
+    horizon_s:       Optional[int] = None
+    # Optional mid-run recovery event. None disables (closure stays in place
+    # for the full horizon).
+    recovery:        Optional[RecoveryPolicy] = None
+    # Base horizon H for phase labelling. ACCIDENT PHASE = [0, base_horizon],
+    # RECOVERY PHASE = (base_horizon, horizon_s]. If None, derived as
+    # (recovery.start_s if recovery else horizon_s).
+    base_horizon_s:  Optional[int] = None
+    # Free-text label of the lane transition for the GUI flash, e.g.
+    # "Recovery: 2 → 1 lanes" or "Recovery: 1 → 1 lanes (reopen)".
+    transition_label: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +216,23 @@ class _EngineState:
     # are partially closed. Set when a "Bottleneck Penalty" applies; None
     # otherwise. Reset each tick by the engine main loop.
     partial_cap_per_s: dict[str, Optional[float]] = field(default_factory=dict)
+    # Transition Penalty: per-(edge, cell_idx) speed multiplier applied to
+    # cells that fall within the first 30 m of a merge-target edge.
+    # Maps to 1.0 for cells outside any merge zone.
+    friction_multiplier: dict[tuple[str, int], float] = field(default_factory=dict)
     # Source queue per inflow edge — vehicles waiting to enter when cell 0
     # is already saturated. Each item is a Particle (count + class).
     source_queue: dict[str, list[Particle]]    = field(default_factory=dict)
 
 
-def _init_state(g: nx.DiGraph, cfg: dict) -> _EngineState:
+def _init_state(g: nx.DiGraph, cfg: dict, rng=None) -> _EngineState:
+    """Initialise per-edge state and pre-compute the merge-friction map."""
     st = _EngineState(cfg=cfg, g=g)
+    friction_cfg = cfg.get("merge_friction", _DEFAULT_CFG["merge_friction"])
+    fz_m   = float(friction_cfg.get("merge_zone_m", 30.0))
+    fmin   = float(friction_cfg.get("speed_factor_min", 0.70))
+    fmax   = float(friction_cfg.get("speed_factor_max", 0.80))
+
     for u, v, d in g.edges(data=True):
         lbl = d["label"]
         n = _num_cells_for(d["length_m"], cfg)
@@ -190,6 +245,25 @@ def _init_state(g: nx.DiGraph, cfg: dict) -> _EngineState:
         st.original_lanes[lbl]  = d["lanes"]
         st.partial_cap_per_s[lbl] = None
         st.source_queue[lbl] = []
+
+    # Transition Penalty: identify cells within the first `merge_zone_m` m
+    # of any edge whose source node has ≥ 2 inbound edges.
+    for u, v, d in g.edges(data=True):
+        lbl = d["label"]
+        n_in = g.in_degree(u)
+        if n_in < 2:
+            continue
+        cell_len = st.cell_len[lbl]
+        for ci in range(st.num_cells[lbl]):
+            cell_start = ci * cell_len
+            if cell_start < fz_m:
+                # Sample once per (edge, cell) for determinism.
+                if rng is not None:
+                    factor = rng.uniform(fmin, fmax)
+                else:
+                    factor = (fmin + fmax) / 2.0
+                st.friction_multiplier[(lbl, ci)] = factor
+
     return st
 
 
@@ -421,14 +495,24 @@ def _inject_pulse(state: _EngineState, pulse: dict, scaling: float = 1.0) -> Non
 
 def _cell_speed(state: _EngineState, edge_label: str, cell_idx: int,
                 v_free: float, cfg: dict, *, motorcycle: bool) -> float:
+    """
+    Cell speed = Greenshields(occupancy) × (transition-penalty multiplier
+    if this cell falls within the first 30 m of a merge-target edge, else 1).
+    Motorcycles bypass Greenshields but DO get the merge friction (real
+    riders also slow at junctions).
+    """
     if motorcycle:
-        return v_free
-    occ = _cell_occupancy_metres(state.cells[edge_label][cell_idx], cfg)
-    cap = _cell_max_m(state, edge_label)
-    if cap <= 0:
-        return cfg["greenshields"]["min_speed_mps"]
-    ratio = occ / cap
-    return _greenshields_speed(v_free, ratio, cfg)
+        speed = v_free
+    else:
+        occ = _cell_occupancy_metres(state.cells[edge_label][cell_idx], cfg)
+        cap = _cell_max_m(state, edge_label)
+        if cap <= 0:
+            return cfg["greenshields"]["min_speed_mps"]
+        ratio = occ / cap
+        speed = _greenshields_speed(v_free, ratio, cfg)
+    # Transition Penalty: if this cell is within the merge zone, slow further.
+    factor = state.friction_multiplier.get((edge_label, cell_idx), 1.0)
+    return speed * factor
 
 
 # ---------------------------------------------------------------------------
@@ -450,13 +534,15 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
         from simulation.networks import build_network
         g = build_network(scenario.network_key)
 
-    horizon  = cfg["engine"]["horizon_s"]
+    # Horizon: scenario override beats config default. Spec allows
+    # extended horizons (e.g. 1200/1800/2400 s) for closure-recovery study.
+    horizon  = scenario.horizon_s if scenario.horizon_s else cfg["engine"]["horizon_s"]
     bin_secs = cfg["engine"]["bin_seconds"]
     closure_start = cfg["engine"]["closure_start_s"]
     per_lane_acc  = cfg["engine"]["per_lane_acceptance_per_s"]
     bp_threshold  = cfg["backpressure"]["downstream_threshold"]
 
-    state = _init_state(g, cfg)
+    state = _init_state(g, cfg, rng=rng)
 
     particles_rows: list[dict] = []
 
@@ -479,6 +565,16 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
     closure_cfg = cfg.get("closure", _DEFAULT_CFG["closure"])
     partial_factor = closure_cfg.get("partial_throughput_factor", 0.5)
 
+    # Recovery thresholds: pick the right kph target per network.
+    rec_cfg = cfg.get("recovery", _DEFAULT_CFG["recovery"])
+    rolling_window = int(rec_cfg.get("rolling_window_s", 30))
+    if scenario.network_key in ("RNB", "RSB"):
+        recovery_kph_threshold = float(rec_cfg.get("regional_threshold_kph", 60.0))
+    else:
+        recovery_kph_threshold = float(rec_cfg.get("valley_threshold_kph", 45.0))
+    speed_history: list[float] = []  # per-second vehicle-weighted mean kph
+    recovered_at: Optional[int] = None
+
     for t in range(horizon + 1):
         # ── 1. Apply closure if scheduled ──────────────────────────────
         if t == closure_start and closeable:
@@ -500,10 +596,29 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
             else:
                 state.partial_cap_per_s[closeable] = None
 
+        # ── 1b. Apply recovery (lane-count swap) if scheduled ──────────
+        if scenario.recovery is not None and t == scenario.recovery.start_s and closeable:
+            new_n = max(int(scenario.recovery.new_lane_count), 0)
+            state.effective_lanes[closeable] = new_n
+            orig = state.original_lanes.get(closeable, new_n)
+            if 0 < new_n < orig:
+                state.partial_cap_per_s[closeable] = (
+                    orig * per_lane_acc * partial_factor
+                )
+            else:
+                state.partial_cap_per_s[closeable] = None
+
         # ── 2. Inject demand pulse, smeared across the minute ──────────
-        bin_idx = t // bin_secs
-        if bin_idx < len(scenario.pulses):
-            _inject_pulse_smeared(state, scenario.pulses[bin_idx],
+        # When the horizon exceeds the manual CSV's bin count we LOOP the
+        # CSV — bins 0..N-1 → 0..N-1 → …  This keeps demand realistic
+        # during a recovery phase: we don't reduce volume to "help" the
+        # road recover, and we don't freeze the demand at one repeated
+        # value (which would be unrealistically flat).
+        # The trailing tick at t == horizon is for telemetry only.
+        if t < horizon and scenario.pulses:
+            bin_idx = t // bin_secs
+            pulse_idx = bin_idx % len(scenario.pulses)
+            _inject_pulse_smeared(state, scenario.pulses[pulse_idx],
                                   scaling=scaling,
                                   offset_in_bin=t % bin_secs,
                                   bin_secs=bin_secs)
@@ -646,7 +761,9 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
         for p, src_lbl, _ci in sink_arrivals:
             state.exit_counts[src_lbl][p.cls] += p.count
 
-        # ── 6. Telemetry rows ──────────────────────────────────────────
+        # ── 6. Telemetry rows + rolling V_avg ──────────────────────────
+        net_speed_num = 0.0   # Σ (n_veh × speed_kph_edge)
+        net_veh_total = 0
         for u, v, d in g.edges(data=True):
             lbl = d["label"]
             length = d["length_m"]
@@ -659,6 +776,10 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
             mots = sum(p.count for c in state.cells[lbl] for p in c if p.cls == "motorcycle")
             v_free = d["v_free_mps"]
             v_now  = _greenshields_speed(v_free, ratio, cfg)
+            n_here = cars + hgvs + mots
+            if n_here > 0:
+                net_speed_num += n_here * v_now * 3.6
+                net_veh_total += n_here
             state.edge_rows.append({
                 "time_s":           t,
                 "edge":             lbl,
@@ -688,6 +809,20 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
                     "speed_kph": round(cell_v * 3.6, 2),
                     "n_cells":  state.num_cells[lbl],
                 })
+
+        # Network-wide vehicle-weighted mean speed for this second.
+        net_v_kph = (net_speed_num / net_veh_total) if net_veh_total > 0 else 0.0
+        speed_history.append(net_v_kph)
+        # Rolling V_avg over the last `rolling_window_s` samples.
+        recent = speed_history[-rolling_window:] if len(speed_history) >= rolling_window else speed_history
+        rolling_avg = sum(recent) / len(recent) if recent else 0.0
+        # Recovery flag: only count *after* recovery has been triggered AND
+        # the rolling V_avg crosses the threshold.
+        if (recovered_at is None
+                and scenario.recovery is not None
+                and t >= scenario.recovery.start_s + rolling_window
+                and rolling_avg >= recovery_kph_threshold):
+            recovered_at = t
 
         # ── 7. Per-particle position log ──────────────────────────────
         if emit_particles:
@@ -723,17 +858,37 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
     queued_total = sum(p.count for q in state.source_queue.values() for p in q)
     in_network_total = sum(p.count for cells in state.cells.values()
                            for c in cells for p in c)
+    final_avg = (sum(speed_history[-rolling_window:]) / rolling_window) \
+                if len(speed_history) >= rolling_window else (
+                    sum(speed_history) / len(speed_history) if speed_history else 0.0
+                )
+    base_horizon_s = scenario.base_horizon_s
+    if base_horizon_s is None:
+        base_horizon_s = (scenario.recovery.start_s
+                          if scenario.recovery is not None else horizon)
     summary = {
         "network":           scenario.network_key,
         "direction":         scenario.direction,
         "slot":              scenario.slot,
         "variant":           scenario.variant,
+        "horizon_s":         horizon,
+        "base_horizon_s":    base_horizon_s,
+        "transition_label":  scenario.transition_label,
         "exit_total":        exit_total,
         "escape_total":      escape_total,
         "queued_at_entry":   queued_total,
         "still_in_network":  in_network_total,
         "total_delay_veh_s": round(sum(state.cum_delay.values()), 2),
         "scaling_applied":   round(scaling, 4),
+        # Recovery metrics
+        "recovery_triggered_s": (scenario.recovery.start_s
+                                 if scenario.recovery is not None else None),
+        "recovery_threshold_kph": recovery_kph_threshold,
+        "recovered_at_s":      recovered_at,
+        "recovery_time_s":     ((recovered_at - scenario.recovery.start_s)
+                                if (recovered_at is not None
+                                    and scenario.recovery is not None) else None),
+        "final_rolling_speed_kph": round(final_avg, 2),
     }
     return df, particles_df, summary
 

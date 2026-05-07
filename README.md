@@ -220,6 +220,77 @@ Per network:
 | VEB | `valley_cont_E` | 1 → 0     |
 | VWB | `valley_W_post` | 1 → 0 (no escape route exists) |
 
+### Recovery API and extended horizons
+
+The engine accepts a dynamic `horizon_s` per `Scenario` (default 600 s).
+Spec-supported values: 600, 900, 1200, 1800, 2400 s. The "Closure + Recovery"
+mode runs for `2 × H` seconds: closure phase 0 → H, recovery phase H → 2H.
+
+**Looped CSV inflow**: when the horizon exceeds the manual CSV's bin count,
+the engine **loops** the CSV back to bin 0. So a 1800 s recovery run cycles
+through the 10 manual bins ~3 times. Demand is *not* artificially reduced
+during the recovery phase — a queue forming during closure has to drain
+against the same realistic demand pattern that produced it.
+
+A `RecoveryPolicy(start_s, new_lane_count)` attached to a `Scenario`
+triggers a mid-run lane swap. Example:
+
+```python
+from simulation.engine import Scenario, RecoveryPolicy, simulate
+
+sc = Scenario(
+    network_key="RSB", direction="regional_south", slot="5pm",
+    variant="1_lane_closed",        # closure starts at t=60
+    pulses=pulses,
+    horizon_s=1200,                  # extended horizon
+    recovery=RecoveryPolicy(start_s=600, new_lane_count=2),  # full reopen at t=600
+)
+df, particles_df, summary = simulate(sc)
+print(summary["recovery_time_s"])     # seconds elapsed from trigger to V_avg ≥ threshold
+```
+
+**Recovery thresholds** (network-wide vehicle-weighted rolling-average
+speed, configurable in `simulation.yaml`):
+
+| Network | Threshold |
+| --- | --- |
+| Regional (RNB / RSB) | 60 km/h |
+| Valley (VEB / VWB)   | 45 km/h |
+
+The summary dict surfaces:
+
+| Key | Description |
+| --- | --- |
+| `horizon_s` | The horizon actually used (override or config default) |
+| `recovery_triggered_s` | When the lane swap fired (or `None`) |
+| `recovery_threshold_kph` | The threshold used for this network |
+| `recovered_at_s` | First sim_second after trigger when rolling V_avg ≥ threshold |
+| `recovery_time_s` | `recovered_at_s − recovery_triggered_s` |
+| `final_rolling_speed_kph` | Rolling V_avg over the last `rolling_window_s` (default 30) |
+
+### Transition Penalty (merge friction)
+
+Real merges slow traffic for the first ~30 m of the destination edge as
+drivers adjust. The engine applies a multiplicative speed penalty (drawn
+once per cell from `[speed_factor_min, speed_factor_max]`, default
+`[0.70, 0.80]` = 20–30 % reduction) to every cell that lies within
+`merge_zone_m` (default 30 m) of a merge-target edge — i.e. any edge
+whose source node has ≥ 2 inbound edges. Persists during both closure and
+recovery phases. Motorcycles are subject to the penalty too because real
+riders also slow at junctions, even though they don't contribute to
+occupancy density.
+
+Configuration knobs in `config/simulation.yaml`:
+
+| Key | Default |
+| --- | --- |
+| `merge_friction.merge_zone_m` | 30.0 |
+| `merge_friction.speed_factor_min` | 0.70 |
+| `merge_friction.speed_factor_max` | 0.80 |
+| `recovery.rolling_window_s` | 30 |
+| `recovery.regional_threshold_kph` | 60.0 |
+| `recovery.valley_threshold_kph` | 45.0 |
+
 ### Bottleneck Penalty (2-lane partial closure)
 
 When a 2-lane edge has 1 lane closed (`effective_lanes < original_lanes`
@@ -369,15 +440,59 @@ Closing the window returns to the persistent CLI menu.
 A real-world top-down image overlay is planned for Phase 3 once the
 abstract layout is validated.
 
-### CLI drill-down (Option 3)
+### CLI drill-down (Options 1 and 3)
 
 ```
-Level 1: Direction      (Regional N/S, Valley E/W)
-Level 2: Time slot      (10:00 AM / 1:00 PM / 5:00 PM — strictly the filmed slots)
-Level 3: Incident variant
-            Regional → 3 options (All Open / 1 Lane / 2 Lanes Closed)
-            Valley   → 2 options (All Open / 1 Lane Closed)
+Level 1: Direction       (Regional N/S, Valley E/W)
+Level 2: Time slot       (10:00 AM / 1:00 PM / 5:00 PM — the filmed slots)
+Level 3: Base horizon H  (600 s / 900 s / 1200 s)
+Level 4: Mode
+            (A) Closure preview only  — runs to H
+            (B) Closure + Recovery    — runs to 2 × H
+Level 5: Variant / Transition
+            Mode A → all_open / 1_lane_closed / 2_lanes_closed (regional)
+                     all_open / 1_lane_closed                  (valley)
+            Mode B (Regional) → 2_to_1, 2_to_0, 1_to_2
+            Mode B (Valley)   → 1_to_1
 ```
+
+Cache layout uses **duration-specific subfolders**:
+
+```
+data/synthetic/scenarios/600s/<scenario>.{csv, json, particles.csv}     # Mode A, H=600
+data/synthetic/scenarios/900s/<scenario>.{csv, …}                       # Mode A, H=900
+data/synthetic/scenarios/1200s/<scenario>.{csv, …}                      # Mode A, H=1200
+                                                                        # OR Mode B, H=600 (=2H)
+data/synthetic/scenarios/1800s/<scenario>.{csv, …}                      # Mode B, H=900
+data/synthetic/scenarios/2400s/<scenario>.{csv, …}                      # Mode B, H=1200
+```
+
+When "View pre-computed" doesn't find a scenario, the warning prints the
+exact expected path so you can see whether the bug is the missing run or a
+wrong horizon selection.
+
+### Phase-aware GUI HUD
+
+When the visualizer renders a scenario whose summary JSON includes
+`recovery_triggered_s`, the figure adds:
+
+- **Phase Indicator** (top-left, banner): `STATUS: ACCIDENT PHASE` (red)
+  while `t < base_horizon_s`, switching to `STATUS: RECOVERY PHASE` (teal)
+  the moment the recovery trigger fires.
+- **Time Since Reopening** (top-centre): `reopened: + N s` counter that
+  starts at 0 when the recovery trigger fires and increments each second.
+- **Transition Flash**: a yellow-bordered banner appears on the main map
+  for ~30 seconds after the trigger, displaying the human-readable
+  transition (e.g. *Recovery: 2 lanes closed → 1 lane reopens*). Fades to
+  zero opacity over the 30 s window.
+- **Recovery Progress Bar** (bottom strip): horizontal bar comparing
+  current network V_avg to the network's recovery threshold (60 km/h
+  Regional / 45 km/h Valley). Bar colour: red < 85 % of threshold, orange
+  approaching, green at/above. A dashed vertical marker shows the target
+  on the bar's axis.
+
+Closing a Matplotlib window returns control to the persistent CLI menu —
+no Python process exit.
 
 Selecting a not-yet-cached scenario prints:
 

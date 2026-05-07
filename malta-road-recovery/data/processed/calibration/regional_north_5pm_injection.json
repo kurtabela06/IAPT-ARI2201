@@ -4,7 +4,7 @@
   "manual_total": 418,
   "scaling": 1.0625,
   "injected_total": 441,
-  "simulated_exit": 422,
+  "simulated_exit": 415,
   "iterations": 3,
-  "match_pct": 0.957
+  "match_pct": 0.718
 }

@@ -3,20 +3,24 @@ simulation/cli.py
 =================
 Persistent drill-down menu for the Phase 2 NetworkX engine.
 
-Layout (Q7 spec):
+Hierarchy (revised):
 
     Main menu:
       1. Run a single scenario (live)
       2. Pre-compute all scenarios (batch)
       3. View pre-computed scenario  → drill-down
-      4. Train ML model on scenarios  (Phase 4 stub)
-      5. Predict on a new scenario    (Phase 4 stub)
+      4. Train ML model              [Phase 4 stub]
+      5. Predict on a new scenario   [Phase 4 stub]
       6. Quit
 
-    Option 3 drill-down:
-      Level 1: Direction      (Regional North / South, Valley East / West)
-      Level 2: Time slot      (12 canonical slots)
-      Level 3: Variant        (regional → 3 options, valley → 2)
+    Options 1 and 3 use the same five-level drill-down:
+      Level 1: Direction         (RNB / RSB / VEB / VWB)
+      Level 2: Time slot         (10am / 1pm / 5pm)
+      Level 3: Base horizon H    (600 / 900 / 1200 s)
+      Level 4: Mode              (A: Closure only / B: Closure + Recovery)
+      Level 5: Variant           Mode A → all_open / 1_lane_closed / 2_lanes_closed
+                                Mode B (Regional) → 2_to_1, 2_to_0, 1_to_2
+                                Mode B (Valley)   → 1_to_1
 
 `while True` loop wraps the whole menu — closing a Matplotlib window
 returns to the main menu, never exits Python.
@@ -29,8 +33,11 @@ from pathlib import Path
 
 from simulation.networks    import DIRECTION_TO_NETWORK
 from simulation.scenarios   import (
-    TIME_SLOTS, run_one, run_all, output_paths,
-    REGIONAL_VARIANTS, VALLEY_VARIANTS, variants_for, list_scenarios, SCN_DIR,
+    TIME_SLOTS, BASE_HORIZONS, MODE_CLOSURE_ONLY, MODE_RECOVERY,
+    REGIONAL_TRANSITIONS, VALLEY_TRANSITIONS, REGIONAL_CLOSURE_VARIANTS,
+    VALLEY_CLOSURE_VARIANTS, transitions_for, closure_variants_for,
+    run_one, run_all, output_paths, list_scenarios, count_scenarios,
+    SCN_ROOT,
 )
 from simulation.visualizer  import visualise_scenario
 
@@ -38,8 +45,8 @@ from simulation.visualizer  import visualise_scenario
 DIRECTION_LABEL = {
     "regional_north": "Regional Road Northbound (RNB)",
     "regional_south": "Regional Road Southbound (RSB)",
-    "valley_east":    "Valley Road Eastbound (VEB)",
-    "valley_west":    "Valley Road Westbound (VWB)",
+    "valley_east":    "Valley Road Eastbound  (VEB)",
+    "valley_west":    "Valley Road Westbound  (VWB)",
 }
 
 VARIANT_LABEL = {
@@ -49,10 +56,18 @@ VARIANT_LABEL = {
     "full_closure":    "Full closure",
 }
 
-SLOT_LABEL = {
-    "10am": "10:00 AM",
-    "1pm":  "1:00 PM",
-    "5pm":  "5:00 PM",
+TRANSITION_LABEL = {
+    "2_to_1":  "2 lanes closed → 1 lane reopens",
+    "2_to_0":  "2 lanes closed → still 0 lanes (no recovery)",
+    "1_to_2":  "1 lane closed  → fully reopened",
+    "1_to_1":  "1-lane road    → reopens",
+}
+
+SLOT_LABEL = {"10am": "10:00 AM", "1pm":  "1:00 PM", "5pm":  "5:00 PM"}
+
+MODE_LABEL = {
+    MODE_CLOSURE_ONLY: "(A) Closure preview only — runs to H",
+    MODE_RECOVERY:     "(B) Closure + Recovery   — runs to 2 × H",
 }
 
 
@@ -69,16 +84,15 @@ def _ask(prompt: str) -> str:
 
 def _print_menu_header(title: str, subtitle: str | None = None) -> None:
     print()
-    print("=" * 60)
+    print("=" * 64)
     print(f"  {title}")
     if subtitle:
         print(f"  {subtitle}")
-    print("=" * 60)
+    print("=" * 64)
 
 
 def _select_from(options: list[tuple[str, str]],
                  *, title: str, allow_back: bool = True) -> str | None:
-    """Return the user's chosen key or None if they pick 'back'."""
     while True:
         _print_menu_header(title)
         for i, (_, label) in enumerate(options, 1):
@@ -97,77 +111,94 @@ def _select_from(options: list[tuple[str, str]],
         print("Invalid choice. Try again.")
 
 
+def _drill_down(*, action_label: str) -> tuple[str, str, int, str, str] | None:
+    """
+    Walk the user through the 5-level drill-down. Returns
+    (direction, slot, base_h, mode, variant_or_transition) or None if backed out.
+    """
+    direction = _select_from(
+        [(k, v) for k, v in DIRECTION_LABEL.items()],
+        title=f"{action_label} — Level 1: pick a direction",
+    )
+    if direction is None: return None
+
+    slot = _select_from(
+        [(s, SLOT_LABEL.get(s, s)) for s in TIME_SLOTS],
+        title=f"{DIRECTION_LABEL[direction]} — Level 2: pick a time slot",
+    )
+    if slot is None: return None
+
+    base_h = _select_from(
+        [(str(h), f"H = {h} s  ({h//60} minutes)") for h in BASE_HORIZONS],
+        title=f"{slot} — Level 3: pick the base horizon H",
+    )
+    if base_h is None: return None
+    base_h = int(base_h)
+
+    mode = _select_from(
+        [(MODE_CLOSURE_ONLY, MODE_LABEL[MODE_CLOSURE_ONLY]),
+         (MODE_RECOVERY,     MODE_LABEL[MODE_RECOVERY])],
+        title=f"H = {base_h}s — Level 4: pick a mode",
+    )
+    if mode is None: return None
+
+    if mode == MODE_CLOSURE_ONLY:
+        variants = closure_variants_for(direction)
+        vot = _select_from(
+            [(v, VARIANT_LABEL.get(v, v)) for v in variants],
+            title=f"H = {base_h}s · Closure only — Level 5: pick an incident variant",
+        )
+    else:   # MODE_RECOVERY
+        transitions = transitions_for(direction)
+        vot = _select_from(
+            [(t_key, TRANSITION_LABEL.get(t_key, t_key)) for t_key in transitions],
+            title=f"H = {base_h}s · Closure + Recovery — Level 5: pick a transition",
+        )
+    if vot is None: return None
+
+    return direction, slot, base_h, mode, vot
+
+
 # ---------------------------------------------------------------------------
 # Top-level menu actions
 # ---------------------------------------------------------------------------
 
 def _action_single_run() -> None:
-    direction = _select_from(
-        [(k, v) for k, v in DIRECTION_LABEL.items()],
-        title="Single live run — pick a direction",
-    )
-    if direction is None:
-        return
-    slot = _select_from(
-        [(s, SLOT_LABEL.get(s, s)) for s in TIME_SLOTS],
-        title=f"{DIRECTION_LABEL[direction]} — pick a time slot",
-    )
-    if slot is None:
-        return
-    variants = variants_for(direction)
-    variant = _select_from(
-        [(v, VARIANT_LABEL.get(v, v)) for v in variants],
-        title=f"{slot} — pick an incident variant",
-    )
-    if variant is None:
-        return
+    sel = _drill_down(action_label="Single live run")
+    if sel is None: return
+    direction, slot, base_h, mode, vot = sel
 
-    print(f"\n→ running {direction} / {slot} / {variant} live (force=True)…")
-    summary = run_one(direction, slot, variant, force=True, verbose=True)
+    print(f"\n→ running {direction} / {slot} / H={base_h}s / {mode} / {vot} live (force=True)…")
+    summary = run_one(direction, slot, base_h, mode, vot, force=True, verbose=True)
     print("\nSummary:")
     print(json.dumps(summary, indent=2))
 
-    csv_p, _, _ = output_paths(direction, slot, variant)
+    csv_p, _, _ = output_paths(direction, slot, base_h, mode, vot)
     if _ask("\nOpen the visualisation now? [y/N] ").lower().startswith("y"):
-        visualise_scenario(csv_p, direction=direction, slot=slot, variant=variant)
+        visualise_scenario(csv_p, direction=direction, slot=slot, variant=vot,
+                           summary=summary)
 
 
 def _action_precompute_all() -> None:
     confirm = _ask(
-        "Pre-compute the full 120-scenario grid? [y/N] (use --force to recompute existing) "
+        "Pre-compute the full scenario grid (many combinations)? [y/N] "
     )
     if not confirm.lower().startswith("y"):
         return
     force = _ask("Force recomputation of cached scenarios? [y/N] ").lower().startswith("y")
     summaries = run_all(force=force, verbose=True)
-    print(f"\nDone. {len(summaries)} scenarios available in {SCN_DIR}.")
+    print(f"\nDone. {len(summaries)} scenarios written under {SCN_ROOT}.")
     _ask("\nPress Enter to return to the main menu… ")
 
 
 def _action_view_scenario() -> None:
-    direction = _select_from(
-        [(k, v) for k, v in DIRECTION_LABEL.items()],
-        title="View pre-computed scenario — pick a direction",
-    )
-    if direction is None:
-        return
-    slot = _select_from(
-        [(s, SLOT_LABEL.get(s, s)) for s in TIME_SLOTS],
-        title=f"{DIRECTION_LABEL[direction]} — pick a time slot",
-    )
-    if slot is None:
-        return
-    variants = variants_for(direction)
-    variant = _select_from(
-        [(v, VARIANT_LABEL.get(v, v)) for v in variants],
-        title=f"{slot} — pick an incident variant",
-    )
-    if variant is None:
-        return
+    sel = _drill_down(action_label="View pre-computed scenario")
+    if sel is None: return
+    direction, slot, base_h, mode, vot = sel
 
-    csv_p, json_p, _ = output_paths(direction, slot, variant)
+    csv_p, json_p, _ = output_paths(direction, slot, base_h, mode, vot)
     if not csv_p.exists() or not json_p.exists():
-        print(f"\n  Scenario data not found: {csv_p.name}")
+        print(f"\n  Scenario data not found: {csv_p}")
         print(f"  Please run Option 2 to pre-compute or select Option 1 for a live run.")
         _ask("\nPress Enter to return… ")
         return
@@ -175,13 +206,12 @@ def _action_view_scenario() -> None:
     summary = json.loads(json_p.read_text())
     print("\n  Summary:")
     print(json.dumps(summary, indent=2))
-    visualise_scenario(csv_p, direction=direction, slot=slot, variant=variant)
+    visualise_scenario(csv_p, direction=direction, slot=slot, variant=vot,
+                       summary=summary)
 
 
 def _action_train_ml() -> None:
     print("\n  [Phase 4 stub] ML training not yet wired up.")
-    print("  This option will train an XGBoost model on the 120-scenario "
-          "telemetry once Phase 4 is implemented.")
     _ask("\nPress Enter to return… ")
 
 
@@ -194,15 +224,11 @@ def _action_predict() -> None:
 # Persistent menu loop
 # ---------------------------------------------------------------------------
 
-def _scenario_count() -> int:
-    return len(list(SCN_DIR.glob("*.json")))
-
-
 def run_menu() -> None:
     while True:
         _print_menu_header(
             "Malta Road Recovery — Phase 2 Engine",
-            f"Cached scenarios: {_scenario_count()}",
+            f"Cached scenarios: {count_scenarios()}",
         )
         print("  1. Run a single scenario (live)")
         print("  2. Pre-compute all scenarios (batch)")

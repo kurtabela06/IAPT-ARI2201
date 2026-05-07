@@ -23,63 +23,110 @@ IAPT-ARI2201/
     │                                   # Walks every manual count CSV and writes
     │                                   # aggregated bins, SUMO demand, and metrics.
     │
+    ├── phase2.py                       # Phase 2 driver
+    ├── run.py                          # Run script
+    │
     ├── config/
-    │   ├── roads.yaml                  # geometry, lane counts, speed limits, OSM way IDs
-    │   ├── simulation.yaml             # SUMO run parameters, time steps
-    │   └── ml.yaml                     # hyperparameters, feature names
-
-├── requirements.txt                  # active runtime dependencies + optional SUMO/test comments
+    │   └── simulation.yaml             # SUMO run parameters, time steps
     │
     ├── data/
     │   ├── raw/
     │   │   ├── manual_counts/          # *** PHASE 1 INPUT ***
-    │   │   │   ├── regional_north/<slot>.csv
-    │   │   │   ├── regional_south/<slot>.csv
-    │   │   │   ├── valley_east/<slot>.csv
-    │   │   │   ├── valley_west/<slot>.csv
-    │   │   │   └── README.md           # row-level schema + naming convention
+    │   │   │   ├── README.md           # row-level schema + naming convention
+    │   │   │   ├── regional_north/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   ├── regional_south/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   ├── valley_east/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   └── valley_west/
+    │   │   │       ├── 10am.csv
+    │   │   │       ├── 1pm.csv
+    │   │   │       └── 5pm.csv
     │   │   ├── video/                  # raw 10-minute .mp4 clips (for human observer)
     │   │   └── osm/                    # downloaded .osm files
+    │   │       └── regional_road.osm
     │   ├── processed/
-    │   │   ├── aggregated/             # output of manual_to_sumo.py (per direction):
-    │   │   │   ├── regional_north/<slot>.csv
-    │   │   │   ├── regional_south/<slot>.csv
-    │   │   │   ├── valley_east/<slot>.csv
-    │   │   │   └── valley_west/<slot>.csv
-    │   │   └── calibration/            # output of extract_metrics.py:
-    │   │                               #   <direction>_<slot>_metrics.csv
+    │   │   ├── pulses/                 # output of manual_to_pulse.py (per direction):
+    │   │   │   ├── regional_north/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   ├── regional_south/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   ├── valley_east/
+    │   │   │   │   ├── 10am.csv
+    │   │   │   │   ├── 1pm.csv
+    │   │   │   │   └── 5pm.csv
+    │   │   │   └── valley_west/
+    │   │   │       ├── 10am.csv
+    │   │   │       ├── 1pm.csv
+    │   │   │       └── 5pm.csv
+    │   │   └── calibration/            # calibration injection files
+    │   │       ├── regional_north_10am_injection.json
+    │   │       ├── regional_north_1pm_injection.json
+    │   │       ├── regional_north_5pm_injection.json
+    │   │       ├── regional_south_10am_injection.json
+    │   │       ├── regional_south_1pm_injection.json
+    │   │       ├── regional_south_5pm_injection.json
+    │   │       ├── valley_east_10am_injection.json
+    │   │       ├── valley_east_1pm_injection.json
+    │   │       ├── valley_east_5pm_injection.json
+    │   │       ├── valley_west_10am_injection.json
+    │   │       ├── valley_west_1pm_injection.json
+    │   │       └── valley_west_5pm_injection.json
     │   ├── synthetic/
-    │   │   └── simulation_runs/        # one CSV per TraCI run (Phase 2/3)
+    │   │   └── simulation_runs/        # TraCI run outputs (Phase 2/3)
+    │   │       ├── 600s/
+    │   │       │   ├── regional_north/
+    │   │       │   ├── regional_south/
+    │   │       │   ├── valley_east/
+    │   │       │   └── valley_west/
+    │   │       ├── 900s/
+    │   │       │   ├── regional_north/
+    │   │       │   ├── regional_south/
+    │   │       │   ├── valley_east/
+    │   │       │   └── valley_west/
+    │   │       ├── 1200s/
+    │   │       │   ├── regional_north/
+    │   │       │   ├── regional_south/
+    │   │       │   ├── valley_east/
+    │   │       │   └── valley_west/
+    │   │       ├── 1800s/
+    │   │       │   ├── regional_north/
+    │   │       │   ├── regional_south/
+    │   │       │   ├── valley_east/
+    │   │       │   └── valley_west/
+    │   │       └── 2400s/
+    │   │           ├── regional_north/
+    │   │           ├── regional_south/
+    │   │           ├── valley_east/
+    │   │           └── valley_west/
     │   └── features/
     │       ├── train.csv               # ML feature matrix (Phase 4)
     │       └── test.csv
     │
     ├── data_processing/                # Phase 1 — manual-entry pipeline
     │   ├── __init__.py
-    │   ├── manual_to_sumo.py           # Manual CSV → aggregated bins → SUMO
-    │   │                               #   .rou.xml (vType + route) + .flow.xml (per bin)
-    │   │                               #   CLI: --input <csv>  |  --all
-    │   └── extract_metrics.py          # Aggregated CSV → calibration metrics CSV
-    │                                   #   (flow, density, ratios, incident flag)
-    │                                   #   CLI: --input <csv>  |  --all
+    │   └── manual_to_pulse.py          # Manual CSV → aggregated bins
     │
     ├── simulation/                     # Phase 2 + 3 — SUMO & TraCI
-    │   ├── networks/
-    │   │   ├── regional_road/          # .net.xml, .poly.xml
-    │   │   └── valley_road/
-    │   ├── demand/                     # *** GENERATED by manual_to_sumo.py ***
-    │   │   ├── regional_north_<slot>.rou.xml    regional_north_<slot>.flow.xml
-    │   │   ├── regional_south_<slot>.rou.xml    regional_south_<slot>.flow.xml
-    │   │   ├── valley_east_<slot>.rou.xml       valley_east_<slot>.flow.xml
-    │   │   └── valley_west_<slot>.rou.xml       valley_west_<slot>.flow.xml
-    │   ├── traci/
-    │   │   ├── run_incident.py         # single-run TraCI script
-    │   │   ├── batch_runner.py         # loops over experiment matrix
-    │   │   ├── matrics_logger.py       # logs speed/flow every second
-    │   │   └── congestion_flag.py      # back-pressure detector
-    │   └── sumo_configs/
-    │       ├── regional.sumocfg
-    │       └── valley.sumocfg
+    │   ├── __init__.py
+    │   ├── calibrator.py
+    │   ├── cli.py
+    │   ├── engine.py
+    │   ├── networks.py
+    │   ├── run_sumo.py
+    │   ├── scenarios.py
+    │   └── visualizer.py
     │
     ├── ml/                             # Phase 4 — modelling
     │   ├── build_features.py           # raw sim CSVs → features/train.csv
@@ -91,8 +138,8 @@ IAPT-ARI2201/
     │       └── rf_trec.pkl
     │
     ├── reports/
-    │   ├── figures/                    # exported plots for writeup
-    │   └── validation_notes.md         # manual observations per direction
+    │   ├── validation_notes.md         # manual observations per direction
+    │   └── figures/                    # exported plots for writeup
     │
     └── tests/
         ├── test_traci_loop.py          # Phase 2/3 — TraCI loop tests

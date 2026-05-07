@@ -108,8 +108,21 @@ def visualise_scenario(
     direction:   str,
     slot:        str,
     variant:     str,
+    summary:     dict | None = None,
 ) -> None:
-    """Open an animation window. Closing it returns control."""
+    """
+    Open an animation window for a pre-computed scenario.
+
+    `summary` is the JSON sidecar produced by `scenarios.run_one`. When
+    supplied, the HUD adds:
+      • a Phase Indicator (ACCIDENT / RECOVERY)
+      • a "Time Since Reopening" counter
+      • a Recovery Progress Bar at the bottom of the figure
+      • a transition flash when phase shifts.
+
+    For backwards compatibility, `summary` is optional — if None we try to
+    locate the .json sidecar next to `csv_path`.
+    """
     if not csv_path.exists():
         print(f"  Scenario data not found: {csv_path}")
         print(f"  Please run Option 2 to pre-compute or select Option 1 for a live run.")
@@ -119,6 +132,13 @@ def visualise_scenario(
         print(f"  Particles CSV not found: {particles_path}")
         print(f"  Re-run scenario with Option 1 (force) so the particle log is generated.")
         return
+    if summary is None:
+        json_p = csv_path.with_suffix(".json")
+        if json_p.exists():
+            import json as _json
+            summary = _json.loads(json_p.read_text())
+        else:
+            summary = {}
 
     network_key = DIRECTION_TO_NETWORK[direction]
     g = build_network(network_key)
@@ -129,38 +149,65 @@ def visualise_scenario(
 
     pos = get_layout(network_key)
 
+    # Phase metadata
+    horizon_s        = summary.get("horizon_s", times[-1])
+    base_horizon_s   = summary.get("base_horizon_s") or horizon_s
+    recovery_trigger = summary.get("recovery_triggered_s")    # None if no recovery
+    threshold_kph    = summary.get("recovery_threshold_kph",
+                                   60.0 if "regional" in direction else 45.0)
+    recovered_at     = summary.get("recovered_at_s")
+    transition_label = summary.get("transition_label")
+
     # ── Figure layout ──────────────────────────────────────────────────
-    fig = plt.figure(figsize=(15, 9.5))
+    fig = plt.figure(figsize=(15, 9.8))
     fig.patch.set_facecolor("#fafafa")
 
-    # Telemetry banner (top), main map (middle), legend (right side)
-    banner_ax = fig.add_axes([0.04, 0.92, 0.92, 0.06])
+    banner_ax = fig.add_axes([0.04, 0.91, 0.92, 0.07])
     banner_ax.set_axis_off()
     banner_ax.set_xlim(0, 1); banner_ax.set_ylim(0, 1)
 
-    main_ax = fig.add_axes([0.04, 0.06, 0.74, 0.84])
+    main_ax = fig.add_axes([0.04, 0.13, 0.74, 0.77])
     main_ax.set_aspect("equal")
     main_ax.set_axis_off()
     main_ax.set_facecolor("#fafafa")
 
-    legend_ax = fig.add_axes([0.79, 0.06, 0.18, 0.84])
+    legend_ax = fig.add_axes([0.79, 0.13, 0.18, 0.77])
     legend_ax.set_axis_off()
+
+    # Recovery HUD strip at the bottom (progress bar + threshold legend)
+    hud_ax = fig.add_axes([0.04, 0.03, 0.92, 0.07])
+    hud_ax.set_axis_off()
+    hud_ax.set_xlim(0, 1); hud_ax.set_ylim(0, 1)
 
     # ── Telemetry banner ──────────────────────────────────────────────
     scenario_label = (
         f"{DIRECTION_SHORT[direction]}  •  {SLOT_LABEL.get(slot, slot)}  •  "
         f"{VARIANT_LABEL.get(variant, variant)}"
     )
-    banner_ax.text(0.0, 0.55, scenario_label, fontsize=15,
+    banner_ax.text(0.0, 0.78, scenario_label, fontsize=14,
                    ha="left", va="center", weight="bold", color="#2c3e50")
-    time_text  = banner_ax.text(0.50, 0.55, "", fontsize=13, ha="center",
+    phase_text = banner_ax.text(0.0, 0.30, "", fontsize=11,
+                                ha="left", va="center", weight="bold",
+                                color="#c0392b")
+    time_text  = banner_ax.text(0.50, 0.78, "", fontsize=12, ha="center",
                                 va="center", color="#34495e",
                                 family="monospace")
-    speed_text = banner_ax.text(1.0, 0.55, "", fontsize=13, ha="right",
+    recovery_timer_text = banner_ax.text(0.50, 0.30, "", fontsize=11, ha="center",
+                                         va="center", color="#16a085",
+                                         family="monospace")
+    speed_text = banner_ax.text(1.0, 0.78, "", fontsize=12, ha="right",
                                 va="center", color="#34495e",
                                 family="monospace")
-    banner_ax.text(0.0, 0.05, g.graph["display_name"], fontsize=10,
-                   ha="left", va="center", color="#7f8c8d", style="italic")
+    banner_ax.text(1.0, 0.30, g.graph["display_name"], fontsize=9,
+                   ha="right", va="center", color="#7f8c8d", style="italic")
+
+    # Transition flash — invisible by default, fades in around recovery trigger
+    flash_text = main_ax.text(0.5, 0.95, "", fontsize=14, ha="center",
+                              va="center", color="#c0392b", weight="bold",
+                              transform=main_ax.transAxes,
+                              bbox=dict(boxstyle="round,pad=0.4",
+                                        fc="#fff5b1", ec="#e67e22",
+                                        linewidth=1.5, alpha=0.0))
 
     # ── Graph layout: nodes + static edge lines ──────────────────────
     nx.draw_networkx_nodes(g, pos, ax=main_ax,
@@ -197,10 +244,63 @@ def visualise_scenario(
     # ── Sectioned legend on the right side ─────────────────────────────
     _draw_legend(legend_ax)
 
+    # ── Recovery HUD: progress bar at the bottom ───────────────────────
+    hud_ax.text(0.0, 0.85, "RECOVERY PROGRESS", fontsize=10, weight="bold",
+                color="#2c3e50", ha="left", va="center")
+    hud_ax.text(1.0, 0.85, f"target: {threshold_kph:.0f} km/h", fontsize=9,
+                color="#7f8c8d", ha="right", va="center", style="italic")
+    # Background bar
+    hud_ax.add_patch(plt.Rectangle((0.0, 0.20), 1.0, 0.45,
+                                    facecolor="#ecf0f1", edgecolor="#bdc3c7",
+                                    linewidth=1.0))
+    # Progress fill (will be resized each frame)
+    progress_fill = plt.Rectangle((0.0, 0.20), 0.0, 0.45,
+                                   facecolor=COL_RED, edgecolor="none")
+    hud_ax.add_patch(progress_fill)
+    # Threshold marker — vertical line at target_kph / max_kph
+    # Choose a max display speed of 90 km/h so the bar feels right
+    max_kph_display = max(80.0, threshold_kph * 1.3)
+    target_x = threshold_kph / max_kph_display
+    hud_ax.add_line(plt.Line2D([target_x, target_x], [0.10, 0.75],
+                               color="#2c3e50", linewidth=1.6, linestyle="--"))
+    hud_ax.text(target_x, 0.05, f"{threshold_kph:.0f}", fontsize=8,
+                ha="center", va="top", color="#2c3e50", weight="bold")
+    # Tick markers along the bar
+    for tick_kph in (0, 20, 40, 60, 80):
+        if tick_kph > max_kph_display:
+            continue
+        x = tick_kph / max_kph_display
+        hud_ax.add_line(plt.Line2D([x, x], [0.18, 0.22],
+                                   color="#bdc3c7", linewidth=0.8))
+    progress_label = hud_ax.text(0.0, 0.42, "", fontsize=10, ha="left",
+                                  va="center", color="white", weight="bold",
+                                  zorder=3)
+
     # ── Animation update ──────────────────────────────────────────────
     def frame(t_idx: int):
         t = times[t_idx]
-        time_text.set_text(f"t = {t:>3d} s / {times[-1]} s")
+        time_text.set_text(f"t = {t:>4d} s / {times[-1]} s")
+
+        # Phase Indicator — ACCIDENT (0..base_horizon) / RECOVERY (base_horizon..end)
+        if recovery_trigger is not None and t >= recovery_trigger:
+            phase = "RECOVERY PHASE"
+            phase_colour = "#16a085"
+        elif t >= base_horizon_s:
+            # No recovery scheduled but still past the base horizon — rare
+            phase = "POST-CLOSURE"
+            phase_colour = "#34495e"
+        else:
+            phase = "ACCIDENT PHASE"
+            phase_colour = "#c0392b"
+        phase_text.set_text(f"STATUS: {phase}")
+        phase_text.set_color(phase_colour)
+
+        # Time-Since-Reopening counter — visible only during recovery phase.
+        if recovery_trigger is not None and t >= recovery_trigger:
+            since = t - recovery_trigger
+            recovery_timer_text.set_text(f"reopened: +{since:>4d} s")
+        else:
+            recovery_timer_text.set_text("")
 
         # Compute network-wide mean speed (vehicle-weighted)
         try:
@@ -216,6 +316,39 @@ def visualise_scenario(
         except KeyError:
             mean_speed = 0.0
         speed_text.set_text(f"avg speed: {mean_speed:5.1f} km/h")
+
+        # Update recovery progress bar
+        bar_frac = max(0.0, min(mean_speed / max_kph_display, 1.0))
+        progress_fill.set_width(bar_frac)
+        # Colour: red below threshold, orange near threshold, green above.
+        if mean_speed >= threshold_kph:
+            progress_fill.set_facecolor(COL_GREEN)
+        elif mean_speed >= 0.85 * threshold_kph:
+            progress_fill.set_facecolor(COL_ORANGE)
+        else:
+            progress_fill.set_facecolor(COL_RED)
+        progress_label.set_text(
+            f"  V_avg: {mean_speed:.1f} km/h  |  target {threshold_kph:.0f} km/h"
+            + ("   ✓ recovered" if (recovered_at is not None and t >= recovered_at) else "")
+        )
+
+        # Transition flash — pin around recovery trigger ± 4 s, fade out over 30 s.
+        if recovery_trigger is not None and transition_label and t >= recovery_trigger:
+            time_since = t - recovery_trigger
+            if time_since <= 30:
+                # alpha = 1.0 at trigger, 0.0 at +30s
+                a = max(0.0, 1.0 - time_since / 30.0)
+                flash_text.set_text(transition_label)
+                flash_text.get_bbox_patch().set_alpha(0.85 * a)
+                flash_text.set_alpha(min(1.0, a + 0.2))
+            else:
+                flash_text.set_text("")
+                flash_text.get_bbox_patch().set_alpha(0.0)
+                flash_text.set_alpha(0.0)
+        else:
+            flash_text.set_text("")
+            flash_text.get_bbox_patch().set_alpha(0.0)
+            flash_text.set_alpha(0.0)
 
         # 1. Edge colours, line styles, labels
         for u, v, d in edges:
@@ -273,7 +406,8 @@ def visualise_scenario(
             list(edge_lines.values())
             + list(edge_texts.values())
             + list(scatters.values())
-            + [time_text, speed_text]
+            + [time_text, speed_text, phase_text, recovery_timer_text,
+               progress_fill, progress_label, flash_text]
         )
 
     # Render the t=0 state immediately so the window opens with content
