@@ -291,6 +291,30 @@ Configuration knobs in `config/simulation.yaml`:
 | `recovery.regional_threshold_kph` | 60.0 |
 | `recovery.valley_threshold_kph` | 45.0 |
 
+### Bottleneck-cap acceptance accumulator
+
+The Bottleneck Penalty's per-second cap is a *fractional* rate (e.g. 0.6
+veh/s for a 2L→1L closure). The engine implements this via a **per-edge
+acceptance-credit accumulator**:
+
+- Each tick adds `partial_cap` worth of credit to the edge's credit pool.
+- Each accepted contributing vehicle consumes 1.0 credit.
+- The pool is bounded by `credit_buffer_s × cap` (default 3 seconds of
+  saved-up throughput) so unused capacity does not accumulate
+  indefinitely. Without this cap, a road that sat empty for a while
+  would suddenly accept dozens of vehicles in one tick when demand
+  arrived — which produced inconsistent behaviour between
+  steady-state and post-recovery runs that share the same effective_lanes.
+- Vehicles arrive but credit is empty → particle stays parked on the
+  upstream cell, contributes to backpressure.
+
+This is what makes the partially-reopened lane during recovery absorb
+traffic identically to a steady-state partially-closed road. An earlier
+implementation used `int(partial_cap)` which silently quantised 0.6 veh/s
+to 0 — the open lane looked closed because it accepted nothing per second.
+The credit accumulator fixes that: 0.6 + 0.6 = 1.2 → one vehicle accepted
+on the second tick, leaving 0.2 credit; average rate = 0.6 veh/s.
+
 ### Bottleneck Penalty (2-lane partial closure)
 
 When a 2-lane edge has 1 lane closed (`effective_lanes < original_lanes`
@@ -450,22 +474,68 @@ Level 4: Mode
             (A) Closure preview only  — runs to H
             (B) Closure + Recovery    — runs to 2 × H
 Level 5: Variant / Transition
-            Mode A → all_open / 1_lane_closed / 2_lanes_closed (regional)
-                     all_open / 1_lane_closed                  (valley)
-            Mode B (Regional) → 2_to_1, 2_to_0, 1_to_2
-            Mode B (Valley)   → 1_to_1
+            Mode A → all_open / 1_lane_closed / 2_lanes_closed   (regional)
+                     all_open / 1_lane_closed                    (valley)
+            Mode B (Regional) → 2closed_to_1closed (2 lanes closed → 1 lane closed)
+                                2closed_to_0closed (2 lanes closed → fully reopened)
+                                1closed_to_0closed (1 lane closed  → fully reopened)
+            Mode B (Valley)   → 1closed_to_0closed (1-lane road fully reopens)
 ```
 
 Cache layout uses **duration-specific subfolders**:
 
 ```
-data/synthetic/scenarios/600s/<scenario>.{csv, json, particles.csv}     # Mode A, H=600
-data/synthetic/scenarios/900s/<scenario>.{csv, …}                       # Mode A, H=900
-data/synthetic/scenarios/1200s/<scenario>.{csv, …}                      # Mode A, H=1200
-                                                                        # OR Mode B, H=600 (=2H)
-data/synthetic/scenarios/1800s/<scenario>.{csv, …}                      # Mode B, H=900
-data/synthetic/scenarios/2400s/<scenario>.{csv, …}                      # Mode B, H=1200
+data/synthetic/scenarios/600s/<scenario>.{csv, json, particles.csv}     # Mode A, H=600    (30 scenarios)
+data/synthetic/scenarios/900s/<scenario>.{csv, …}                       # Mode A, H=900    (30 scenarios)
+data/synthetic/scenarios/1200s/<scenario>.{csv, …}                      # Mode A, H=1200 + Mode B, H=600  (54 scenarios)
+data/synthetic/scenarios/1800s/<scenario>.{csv, …}                      # Mode B, H=900    (24 scenarios)
+data/synthetic/scenarios/2400s/<scenario>.{csv, …}                      # Mode B, H=1200   (24 scenarios)
 ```
+
+**Total: 162 scenarios** — the full grid covers every combination the CLI
+drill-down can reach (`4 directions × 3 slots × 3 horizons × variants`).
+Run `python simulation/scenarios.py --all` to populate the cache. The batch
+runner also rebuilds the ML feature CSV at the end (see below).
+
+### ML feature snapshots (Phase 4 input)
+
+After every batch pre-compute, the engine extracts one **feature snapshot
+per scenario** at `T = base_horizon_s` — the moment of reopening for
+Mode B, the end of the closure phase for Mode A. All snapshots aggregate
+into a single CSV:
+
+```
+data/ml_training/recovery_stats.csv
+```
+
+Schema (one row per scenario, 162 rows total):
+
+| column                  | description                                                       |
+| ----------------------- | ----------------------------------------------------------------- |
+| `road_id`               | direction (regional_north / regional_south / valley_east / valley_west) |
+| `network_key`           | RNB / RSB / VEB / VWB                                             |
+| `slot`                  | 10am / 1pm / 5pm                                                  |
+| `base_horizon_s`        | 600 / 900 / 1200 (H)                                              |
+| `horizon_s`             | actual run length (H for Mode A, 2H for Mode B)                   |
+| `mode`                  | closure_only / recovery                                           |
+| `transition_type`       | e.g. `1_lane_closed`, `2closed_to_1closed`                        |
+| `snapshot_time_s`       | T = base_horizon_s                                                |
+| `total_occupied_meters` | Σ occupied_m across all edges at T (5m × cars + 8m × HGVs)        |
+| `queue_length_m`        | contiguous "red" cell run-length backwards from the trunk's diverge end |
+| `current_inflow_rate`   | vehicles/s being injected at T                                    |
+| `hgv_percentage`        | HGV share of (cars + HGV) on the network at T                     |
+| `recovery_threshold_kph` | network's V_avg target (60 Regional / 45 Valley)                 |
+| `recovery_triggered_s`  | T value used by the engine (None for Mode A)                      |
+| `time_to_recovery`      | **ML label** — seconds from T until rolling V_avg ≥ threshold; null if not recovered within horizon |
+| `scenario_csv`          | provenance path back to the source telemetry CSV                  |
+
+Run on-demand (without re-simulating) via:
+
+```bash
+python simulation/build_features.py
+```
+
+Or interactively from the CLI menu — **Option 4: Rebuild ML feature snapshots**.
 
 When "View pre-computed" doesn't find a scenario, the warning prints the
 exact expected path so you can see whether the bug is the missing run or a

@@ -111,6 +111,15 @@ _DEFAULT_CFG = {
         #     original_lanes * per_lane_acceptance_per_s * partial_throughput_factor
         # i.e. 50 % of the *original* free-flow throughput by default.
         "partial_throughput_factor": 0.5,
+        # Maximum acceptance-credit buffer (seconds of saved-up throughput).
+        # Without this cap the credit pool accumulates unboundedly whenever
+        # arrivals lag — which makes the bottleneck effectively useless for
+        # steady-state flows. With a small buffer (a few seconds) the cap
+        # behaves consistently whether the road was always partially closed
+        # or just recently reopened to the partial state. Must be large
+        # enough that the pool can hold ≥1 vehicle credit (1 / partial_cap_s)
+        # at the lowest expected rate, else nothing will ever pass through.
+        "credit_buffer_s": 3.0,
     },
     # ─── Transition Penalty (global merge friction) ────────────────────
     # For the first `merge_zone_m` metres of any edge whose source node has
@@ -212,10 +221,15 @@ class _EngineState:
     cell_rows:     list[dict]                  = field(default_factory=list)
     effective_lanes: dict[str, int]            = field(default_factory=dict)
     original_lanes:  dict[str, int]            = field(default_factory=dict)
-    # Per-second acceptance cap for the *first cell* of an edge whose lanes
-    # are partially closed. Set when a "Bottleneck Penalty" applies; None
-    # otherwise. Reset each tick by the engine main loop.
+    # Per-second acceptance cap (vehicles/s, may be fractional) for the
+    # first cell of a partially-closed edge. None when no cap applies.
     partial_cap_per_s: dict[str, Optional[float]] = field(default_factory=dict)
+    # Acceptance-credit accumulator. Each second we add the cap to the
+    # accumulator; particles consume 1.0 credit each. This lets fractional
+    # rates (e.g. 0.6 veh/s) work correctly: every second 0.6 credit is
+    # added; on average 1 vehicle per ~1.67 s passes through. Without this
+    # the int() quantisation pinned the throughput to 0 veh/s.
+    accept_credit: dict[str, float]            = field(default_factory=dict)
     # Transition Penalty: per-(edge, cell_idx) speed multiplier applied to
     # cells that fall within the first 30 m of a merge-target edge.
     # Maps to 1.0 for cells outside any merge zone.
@@ -244,6 +258,7 @@ def _init_state(g: nx.DiGraph, cfg: dict, rng=None) -> _EngineState:
         st.effective_lanes[lbl] = d["lanes"]
         st.original_lanes[lbl]  = d["lanes"]
         st.partial_cap_per_s[lbl] = None
+        st.accept_credit[lbl]    = 0.0
         st.source_queue[lbl] = []
 
     # Transition Penalty: identify cells within the first `merge_zone_m` m
@@ -607,6 +622,19 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
                 )
             else:
                 state.partial_cap_per_s[closeable] = None
+        # ── 1c. Replenish per-edge acceptance credits ──────────────────
+        # Each tick adds the partial cap (vehicles/s) to the edge's credit
+        # pool. _resolve_edge_arrivals draws 1.0 credit per accepted
+        # vehicle. Pool is bounded by `credit_buffer_s × cap` so unused
+        # capacity does not accumulate indefinitely — that would make the
+        # cap practically useless under bursty demand and produce
+        # inconsistent behaviour between steady-state and post-recovery
+        # runs that share the same effective_lanes.
+        credit_buffer_s = closure_cfg.get("credit_buffer_s", 1.0)
+        for lbl, cap in state.partial_cap_per_s.items():
+            if cap is not None:
+                new_credit = state.accept_credit.get(lbl, 0.0) + cap
+                state.accept_credit[lbl] = min(new_credit, cap * credit_buffer_s)
 
         # ── 2. Inject demand pulse, smeared across the minute ──────────
         # When the horizon exceeds the manual CSV's bin count we LOOP the
@@ -996,11 +1024,21 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
     cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
     available_m = max(cell_max_m - cell_used, 0.0)
 
-    # Bottleneck Penalty: partial-closure cap per second on this edge's
-    # first cell. When set, accepted vehicle-equivalent throughput in this
-    # second is bounded by `partial_cap_per_s`.
-    partial_cap = state.partial_cap_per_s.get(target_edge)
-    accepted_this_sec = 0  # count of contributing vehicles accepted
+    # Bottleneck Penalty: a fractional per-second cap (e.g. 0.6 veh/s) is
+    # implemented via the `accept_credit` accumulator: each tick adds
+    # `partial_cap` credit; each accepted contributing vehicle consumes
+    # 1.0 credit. None ⇒ no cap (uncapped).
+    has_cap = state.partial_cap_per_s.get(target_edge) is not None
+
+    def _take_credit(n: int) -> int:
+        """Consume up to n vehicles' worth of credit; return how many were granted."""
+        if not has_cap:
+            return n
+        bal = state.accept_credit.get(target_edge, 0.0)
+        granted = min(n, int(bal))
+        if granted > 0:
+            state.accept_credit[target_edge] = bal - granted
+        return granted
 
     for p, src_lbl, src_ci in arrivals:
         veh_cfg = cfg["vehicles"].get(p.cls, {})
@@ -1008,30 +1046,24 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
         contributes = veh_cfg.get("contributes_to_occupancy", False)
 
         if not contributes:
+            # Motorcycles bypass both spatial and per-second caps.
             state.cells[target_edge][0].append(
                 Particle(cls=p.cls, count=p.count, pos_m=0.0)
             )
             continue
 
-        # Compute the per-second cap headroom (None ⇒ uncapped).
-        if partial_cap is not None:
-            budget_remaining = max(int(partial_cap) - accepted_this_sec, 0)
-        else:
-            budget_remaining = None
-
-        if cell_ratio < bp_threshold and (budget_remaining is None or budget_remaining > 0):
-            # Free transfer below threshold, possibly limited by partial cap.
-            if budget_remaining is None:
-                accept_n = p.count
-            else:
-                accept_n = min(p.count, budget_remaining)
-            state.cells[target_edge][0].append(
-                Particle(cls=p.cls, count=accept_n, pos_m=0.0)
-            )
-            cell_used += accept_n * len_per
-            available_m = max(cell_max_m - cell_used, 0.0)
-            cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
-            accepted_this_sec += accept_n
+        # Free transfer when target is below the backpressure threshold.
+        # Even in this regime the partial cap (if active) governs how many
+        # vehicles can enter per second.
+        if cell_ratio < bp_threshold:
+            accept_n = _take_credit(p.count)
+            if accept_n > 0:
+                state.cells[target_edge][0].append(
+                    Particle(cls=p.cls, count=accept_n, pos_m=0.0)
+                )
+                cell_used += accept_n * len_per
+                available_m = max(cell_max_m - cell_used, 0.0)
+                cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
             rejected = p.count - accept_n
             if rejected > 0:
                 src_cell_len = state.cell_len[src_lbl]
@@ -1041,11 +1073,10 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
                 state.cum_delay[src_lbl] += rejected * 1.0
             continue
 
+        # Above-threshold: cap by spatial slack AND (if active) the credit.
         max_by_space = int(available_m // max(len_per, 0.01)) if len_per > 0 else p.count
-        if budget_remaining is not None:
-            accept_n = max(min(p.count, max_by_space, budget_remaining), 0)
-        else:
-            accept_n = max(min(p.count, max_by_space), 0)
+        accept_n = max(min(p.count, max_by_space), 0)
+        accept_n = _take_credit(accept_n)
         if accept_n > 0:
             state.cells[target_edge][0].append(
                 Particle(cls=p.cls, count=accept_n, pos_m=0.0)
@@ -1053,7 +1084,6 @@ def _resolve_edge_arrivals(state: _EngineState, cfg: dict,
             cell_used += accept_n * len_per
             available_m = max(cell_max_m - cell_used, 0.0)
             cell_ratio = cell_used / cell_max_m if cell_max_m > 0 else 1.0
-            accepted_this_sec += accept_n
         rejected = p.count - accept_n
         if rejected > 0:
             src_cell_len = state.cell_len[src_lbl]

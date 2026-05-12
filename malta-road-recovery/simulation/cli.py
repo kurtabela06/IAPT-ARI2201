@@ -7,11 +7,12 @@ Hierarchy (revised):
 
     Main menu:
       1. Run a single scenario (live)
-      2. Pre-compute all scenarios (batch)
+      2. Pre-compute all scenarios (batch)  → also rebuilds the ML CSV
       3. View pre-computed scenario  → drill-down
-      4. Train ML model              [Phase 4 stub]
-      5. Predict on a new scenario   [Phase 4 stub]
-      6. Quit
+      4. Rebuild ML feature snapshots (data/ml_training/recovery_stats.csv)
+      5. Train ML model              [Phase 4 stub]
+      6. Predict on a new scenario   [Phase 4 stub]
+      7. Quit
 
     Options 1 and 3 use the same five-level drill-down:
       Level 1: Direction         (RNB / RSB / VEB / VWB)
@@ -57,10 +58,9 @@ VARIANT_LABEL = {
 }
 
 TRANSITION_LABEL = {
-    "2_to_1":  "2 lanes closed → 1 lane reopens",
-    "2_to_0":  "2 lanes closed → still 0 lanes (no recovery)",
-    "1_to_2":  "1 lane closed  → fully reopened",
-    "1_to_1":  "1-lane road    → reopens",
+    "2closed_to_1closed":  "2 lanes closed → 1 lane closed",
+    "2closed_to_0closed":  "2 lanes closed → 0 lanes closed (fully reopened)",
+    "1closed_to_0closed":  "1 lane closed  → 0 lanes closed (fully reopened)",
 }
 
 SLOT_LABEL = {"10am": "10:00 AM", "1pm":  "1:00 PM", "5pm":  "5:00 PM"}
@@ -210,8 +210,21 @@ def _action_view_scenario() -> None:
                        summary=summary)
 
 
+def _action_build_features() -> None:
+    print("\n  Rebuilding ML feature snapshots from the scenario cache…")
+    try:
+        from simulation.build_features import build_all as _build_all
+        out = _build_all()
+        print(f"\n  Wrote → {out}")
+    except Exception as exc:
+        print(f"\n  Build failed: {exc}")
+    _ask("\nPress Enter to return… ")
+
+
 def _action_train_ml() -> None:
     print("\n  [Phase 4 stub] ML training not yet wired up.")
+    print("  data/ml_training/recovery_stats.csv is ready for downstream "
+          "XGBoost / RF / linear baselines.")
     _ask("\nPress Enter to return… ")
 
 
@@ -233,9 +246,10 @@ def run_menu() -> None:
         print("  1. Run a single scenario (live)")
         print("  2. Pre-compute all scenarios (batch)")
         print("  3. View pre-computed scenario")
-        print("  4. Train ML model on scenarios   [Phase 4 stub]")
-        print("  5. Predict on a new scenario     [Phase 4 stub]")
-        print("  6. Quit")
+        print("  4. Rebuild ML feature snapshots (recovery_stats.csv)")
+        print("  5. Train ML model on scenarios   [Phase 4 stub]")
+        print("  6. Predict on a new scenario     [Phase 4 stub]")
+        print("  7. Quit")
         choice = _ask("\n> ")
 
         if choice == "1":
@@ -245,10 +259,12 @@ def run_menu() -> None:
         elif choice == "3":
             _action_view_scenario()
         elif choice == "4":
-            _action_train_ml()
+            _action_build_features()
         elif choice == "5":
+            _action_train_ml()
+        elif choice == "6":
             _action_predict()
-        elif choice in ("6", "q", "quit", "exit"):
+        elif choice in ("7", "q", "quit", "exit"):
             print("\nBye.\n")
             return
         else:

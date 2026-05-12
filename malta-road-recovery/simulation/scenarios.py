@@ -62,16 +62,22 @@ DIRECTIONS    = list(DIRECTION_TO_NETWORK.keys())
 MODE_CLOSURE_ONLY = "closure_only"
 MODE_RECOVERY     = "recovery"
 
-# For Mode B (recovery), the transition is the closure→recovery state pair.
+# For Mode B (recovery), the transition encodes how many lanes are CLOSED
+# before and after recovery — matching the user's mental model.
 # Format: (closure_variant, new_lane_count_after_recovery)
+#
+# Regional roads are 2-lane Main Ways, so:
+#   "2closed_to_1closed"  starts with both lanes shut (eff=0), recovery reopens 1 lane (eff=1)
+#   "2closed_to_0closed"  starts with both lanes shut (eff=0), recovery reopens fully (eff=2)
+#   "1closed_to_0closed"  starts with 1 lane shut (eff=1), recovery reopens fully (eff=2)
 REGIONAL_TRANSITIONS = {
-    "2_to_1": ("2_lanes_closed", 1),   # closure 2L→0, recovery to 1 lane
-    "2_to_0": ("2_lanes_closed", 0),   # closure 2L→0, recovery to 0 lanes (still closed)
-    "1_to_2": ("1_lane_closed",  2),   # closure 2L→1, recovery to full 2 lanes
+    "2closed_to_1closed":  ("2_lanes_closed", 1),
+    "2closed_to_0closed":  ("2_lanes_closed", 2),
+    "1closed_to_0closed":  ("1_lane_closed",  2),
 }
-# For valley (single-lane), only one transition makes physical sense:
+# Valley roads are 1-lane; "1 closed → 0 closed" is the only sensible recovery.
 VALLEY_TRANSITIONS = {
-    "1_to_1": ("1_lane_closed",  1),   # closure 1L→0, recovery to 1 lane (full reopen)
+    "1closed_to_0closed":  ("1_lane_closed",  1),
 }
 
 # Closure variants for Mode A (closure-only previews):
@@ -153,12 +159,11 @@ def _build_scenario(direction: str, slot: str, base_h: int, mode: str,
 
 def _transition_label(transition_key: str, closure_variant: str, recovery_lanes: int) -> str:
     pretty = {
-        "2_to_1":  "Recovery: 2 lanes closed → 1 lane reopens",
-        "2_to_0":  "Recovery: 2 lanes closed → still 0 lanes",
-        "1_to_2":  "Recovery: 1 lane closed → fully reopened",
-        "1_to_1":  "Recovery: 1-lane road reopens",
+        "2closed_to_1closed":  "Recovery: 2 lanes closed → 1 lane closed",
+        "2closed_to_0closed":  "Recovery: 2 lanes closed → fully reopened",
+        "1closed_to_0closed":  "Recovery: 1 lane closed  → fully reopened",
     }
-    return pretty.get(transition_key, f"Recovery → {recovery_lanes} lanes")
+    return pretty.get(transition_key, f"Recovery → eff_lanes={recovery_lanes}")
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +190,30 @@ def run_one(direction: str, slot: str, base_h: int, mode: str,
     summary["base_horizon_s"]   = base_h
     summary["mode"]             = mode
     summary["variant_or_transition"] = variant_or_transition
-    summary["injection_count"]  = sc.injection_count
+    # Calibrated injection per CSV cycle (H=600 baseline):
+    summary["calibrated_inflow_per_cycle"] = sc.injection_count
+    # Actual injected total = sum(injected per bin) over all bins consumed
+    # by the looped inflow in this run's horizon.
+    bin_secs = cfg["engine"]["bin_seconds"]
+    bins_per_cycle = len(sc.pulses) if sc.pulses else 1
+    horizon = sc.horizon_s or cfg["engine"]["horizon_s"]
+    bins_injected = horizon // bin_secs       # whole bins, since t < horizon guard
+    # Per-bin counts after scaling
+    if sc.pulses and sc.injection_count:
+        observed_per_cycle = sum(p["car"]+p["hgv"]+p["motorcycle"] for p in sc.pulses)
+        scaling = (sc.injection_count / observed_per_cycle) if observed_per_cycle else 1.0
+        # Sum the integer-rounded injection per bin (looped) over bins_injected.
+        total_inj = 0
+        for b in range(bins_injected):
+            p = sc.pulses[b % bins_per_cycle]
+            for cls in ("car", "hgv", "motorcycle"):
+                total_inj += int(round(p.get(cls, 0) * scaling))
+        summary["injection_count"] = total_inj
+    else:
+        summary["injection_count"] = sc.injection_count or 0
+    summary["loop_cycles"]      = round(bins_injected / bins_per_cycle, 3)
     summary["calibration_scl"]  = (sc.injection_count / sum(p["car"]+p["hgv"]+p["motorcycle"]
-                                                            for p in sc.pulses) ) if sc.pulses else 1.0
+                                                            for p in sc.pulses)) if sc.pulses else 1.0
     json_p.write_text(json.dumps(summary, indent=2))
 
     if verbose:
@@ -216,7 +242,8 @@ def iterate_grid():
                     yield direction, slot, base_h, MODE_RECOVERY, t_key
 
 
-def run_all(*, force: bool = False, verbose: bool = True) -> list[dict]:
+def run_all(*, force: bool = False, verbose: bool = True,
+            build_ml_features: bool = True) -> list[dict]:
     summaries = []
     grid = list(iterate_grid())
     total = len(grid)
@@ -227,6 +254,17 @@ def run_all(*, force: bool = False, verbose: bool = True) -> list[dict]:
                                  force=force, verbose=verbose))
     if verbose:
         print(f"\n[scn] {len(summaries)} scenarios written under {SCN_ROOT}")
+
+    # Prompt 2: aggregate ML snapshot features.
+    if build_ml_features:
+        try:
+            from simulation.build_features import build_all as _build_features_all
+            if verbose:
+                print(f"\n[scn] Building ML feature snapshots → data/ml_training/recovery_stats.csv")
+            _build_features_all()
+        except Exception as exc:
+            print(f"  [scn] ML feature build failed: {exc}")
+
     return summaries
 
 
