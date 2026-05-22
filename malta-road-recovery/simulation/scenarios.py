@@ -170,39 +170,23 @@ def _transition_label(transition_key: str, closure_variant: str, recovery_lanes:
 # Scenario runner
 # ---------------------------------------------------------------------------
 
-def run_one(direction: str, slot: str, base_h: int, mode: str,
-            variant_or_transition: str,
-            *, force: bool = False, verbose: bool = False) -> dict:
-    """Run one (direction, slot, H, mode, variant_or_transition) scenario."""
-    csv_p, json_p, pcsv_p = output_paths(direction, slot, base_h, mode, variant_or_transition)
-    if csv_p.exists() and json_p.exists() and pcsv_p.exists() and not force:
-        if verbose:
-            print(f"  [scn] {csv_p.parent.name}/{csv_p.stem}: cached")
-        return json.loads(json_p.read_text())
-
-    sc = _build_scenario(direction, slot, base_h, mode, variant_or_transition)
-    cfg = load_engine_config()
-    df, particles_df, summary = simulate(sc, cfg=cfg)
-
-    df.to_csv(csv_p, index=False)
-    particles_df.to_csv(pcsv_p, index=False)
+def _enrich_summary(summary: dict, sc, cfg: dict, *,
+                    slot: str, base_h: int, mode: str,
+                    variant_or_transition: str) -> dict:
+    """Attach provenance + injection-accounting fields to an engine summary."""
     summary["manual_slot"]      = slot
     summary["base_horizon_s"]   = base_h
     summary["mode"]             = mode
     summary["variant_or_transition"] = variant_or_transition
-    # Calibrated injection per CSV cycle (H=600 baseline):
     summary["calibrated_inflow_per_cycle"] = sc.injection_count
-    # Actual injected total = sum(injected per bin) over all bins consumed
-    # by the looped inflow in this run's horizon.
+
     bin_secs = cfg["engine"]["bin_seconds"]
     bins_per_cycle = len(sc.pulses) if sc.pulses else 1
     horizon = sc.horizon_s or cfg["engine"]["horizon_s"]
-    bins_injected = horizon // bin_secs       # whole bins, since t < horizon guard
-    # Per-bin counts after scaling
+    bins_injected = horizon // bin_secs
     if sc.pulses and sc.injection_count:
         observed_per_cycle = sum(p["car"]+p["hgv"]+p["motorcycle"] for p in sc.pulses)
         scaling = (sc.injection_count / observed_per_cycle) if observed_per_cycle else 1.0
-        # Sum the integer-rounded injection per bin (looped) over bins_injected.
         total_inj = 0
         for b in range(bins_injected):
             p = sc.pulses[b % bins_per_cycle]
@@ -211,11 +195,56 @@ def run_one(direction: str, slot: str, base_h: int, mode: str,
         summary["injection_count"] = total_inj
     else:
         summary["injection_count"] = sc.injection_count or 0
-    summary["loop_cycles"]      = round(bins_injected / bins_per_cycle, 3)
-    summary["calibration_scl"]  = (sc.injection_count / sum(p["car"]+p["hgv"]+p["motorcycle"]
-                                                            for p in sc.pulses)) if sc.pulses else 1.0
-    json_p.write_text(json.dumps(summary, indent=2))
+    summary["loop_cycles"]     = round(bins_injected / bins_per_cycle, 3)
+    summary["calibration_scl"] = (sc.injection_count / sum(p["car"]+p["hgv"]+p["motorcycle"]
+                                                           for p in sc.pulses)) if sc.pulses else 1.0
+    return summary
 
+
+def simulate_scenario(direction: str, slot: str, base_h: int, mode: str,
+                      variant_or_transition: str, *,
+                      rng_seed: int = 42,
+                      write_files: bool = True,
+                      emit_particles: bool = True):
+    """
+    Run one scenario and return (summary, edge_df, particles_df).
+
+    write_files=True  → persist <H>s/<scenario>.{csv,json,particles.csv}
+    write_files=False → run fully headless in memory (Mode-B seeds 1..4)
+    The DataFrames are always returned so the caller can snapshot ML
+    features even on a headless run.
+    """
+    sc = _build_scenario(direction, slot, base_h, mode, variant_or_transition)
+    cfg = load_engine_config()
+    df, particles_df, summary = simulate(
+        sc, cfg=cfg, rng_seed=rng_seed, emit_particles=emit_particles
+    )
+    _enrich_summary(summary, sc, cfg, slot=slot, base_h=base_h,
+                    mode=mode, variant_or_transition=variant_or_transition)
+
+    if write_files:
+        csv_p, json_p, pcsv_p = output_paths(direction, slot, base_h, mode,
+                                             variant_or_transition)
+        df.to_csv(csv_p, index=False)
+        particles_df.to_csv(pcsv_p, index=False)
+        json_p.write_text(json.dumps(summary, indent=2))
+    return summary, df, particles_df
+
+
+def run_one(direction: str, slot: str, base_h: int, mode: str,
+            variant_or_transition: str,
+            *, force: bool = False, verbose: bool = False) -> dict:
+    """Run + persist one scenario (used by single-scenario CLI previews)."""
+    csv_p, json_p, pcsv_p = output_paths(direction, slot, base_h, mode, variant_or_transition)
+    if csv_p.exists() and json_p.exists() and pcsv_p.exists() and not force:
+        if verbose:
+            print(f"  [scn] {csv_p.parent.name}/{csv_p.stem}: cached")
+        return json.loads(json_p.read_text())
+
+    summary, _df, _pdf = simulate_scenario(
+        direction, slot, base_h, mode, variant_or_transition,
+        rng_seed=42, write_files=True, emit_particles=True
+    )
     if verbose:
         rec = summary.get("recovery_time_s")
         rec_str = f"  recovery={rec}s" if rec is not None else ""
@@ -242,30 +271,115 @@ def iterate_grid():
                     yield direction, slot, base_h, MODE_RECOVERY, t_key
 
 
-def run_all(*, force: bool = False, verbose: bool = True,
-            build_ml_features: bool = True) -> list[dict]:
-    summaries = []
+ML_FACTORY_RUNS = 5   # Mode B multi-seed loop count
+
+
+def run_standard_batch(*, force: bool = False, verbose: bool = True) -> list[dict]:
+    """
+    Mode A — Standard Batch (1× run).
+
+    Iterates the full scenario matrix once with the fixed default seed.
+    Writes the detailed JSON/CSV playback files into the duration
+    subfolders. Appends EXACTLY ONE set of transition snapshots
+    (run_id = 1) to data/ml_training/master_traffic_features.csv.
+    """
+    from simulation.build_features import (
+        purge_ml_dir, snapshot_row, append_rows,
+    )
+
     grid = list(iterate_grid())
     total = len(grid)
+    purge_ml_dir()                       # Prompt 1 — clean before fresh data
+    summaries, ml_rows = [], []
+
     for i, (direction, slot, base_h, mode, vot) in enumerate(grid, 1):
         if verbose:
-            print(f"\n[{i:3d}/{total}] {direction} / {slot} / H={base_h}s / {mode} / {vot}")
-        summaries.append(run_one(direction, slot, base_h, mode, vot,
-                                 force=force, verbose=verbose))
+            print(f"[{i:3d}/{total}] {direction}/{slot}/H={base_h}s/{mode}/{vot}")
+        # Skip re-sim if cached and not forced (visual files are reusable).
+        csv_p, json_p, pcsv_p = output_paths(direction, slot, base_h, mode, vot)
+        if csv_p.exists() and json_p.exists() and pcsv_p.exists() and not force:
+            import pandas as _pd
+            summary = json.loads(json_p.read_text())
+            edge_df = _pd.read_csv(csv_p)
+            part_df = _pd.read_csv(pcsv_p)
+        else:
+            summary, edge_df, part_df = simulate_scenario(
+                direction, slot, base_h, mode, vot,
+                rng_seed=42, write_files=True, emit_particles=True,
+            )
+        summaries.append(summary)
+        ml_rows.append(snapshot_row(summary, edge_df, part_df, run_id=1))
+
+    append_rows(ml_rows)
     if verbose:
-        print(f"\n[scn] {len(summaries)} scenarios written under {SCN_ROOT}")
-
-    # Prompt 2: aggregate ML snapshot features.
-    if build_ml_features:
-        try:
-            from simulation.build_features import build_all as _build_features_all
-            if verbose:
-                print(f"\n[scn] Building ML feature snapshots → data/ml_training/recovery_stats.csv")
-            _build_features_all()
-        except Exception as exc:
-            print(f"  [scn] ML feature build failed: {exc}")
-
+        print(f"\n[batch-A] {len(summaries)} scenarios → {SCN_ROOT}")
+        print(f"[batch-A] {len(ml_rows)} ML rows (run_id=1) → "
+              f"data/ml_training/master_traffic_features.csv")
     return summaries
+
+
+def run_ml_factory_batch(*, verbose: bool = True,
+                         runs: int = ML_FACTORY_RUNS) -> int:
+    """
+    Mode B — ML-Factory Batch (5× multi-seed loop).
+
+    Runs the entire scenario matrix `runs` times. Each iteration uses a
+    distinct pseudo-random seed which varies vehicle spawn-second, the
+    Car/HGV spawn order, and the 20–30 % merge-friction penalty.
+
+    File-preservation rule: iterations 1..(runs-1) run fully headless in
+    memory (no JSON/CSV written — avoids bloat). Only the FINAL iteration
+    writes the playback files.
+
+    ML-logging rule: EVERY iteration appends its T = base_horizon_s snapshot
+    to master_traffic_features.csv with a run_id column (1..runs).
+    """
+    from simulation.build_features import (
+        purge_ml_dir, snapshot_row, append_rows,
+    )
+
+    purge_ml_dir()                       # Prompt 1 — clean before fresh data
+    grid = list(iterate_grid())
+    total = len(grid)
+    total_rows = 0
+
+    for run_id in range(1, runs + 1):
+        # Distinct seed per run; final run also writes the playback files.
+        seed = 1000 + run_id * 7919      # spread seeds well apart
+        is_final = (run_id == runs)
+        if verbose:
+            mode_str = "FINAL — writing JSON" if is_final else "headless"
+            print(f"\n=== ML-Factory run {run_id}/{runs}  (seed={seed}, {mode_str}) ===")
+
+        ml_rows = []
+        for i, (direction, slot, base_h, mode, vot) in enumerate(grid, 1):
+            if verbose and i % 30 == 0:
+                print(f"  run {run_id}: {i}/{total}")
+            summary, edge_df, part_df = simulate_scenario(
+                direction, slot, base_h, mode, vot,
+                rng_seed=seed,
+                write_files=is_final,        # only the 5th run persists files
+                emit_particles=True,         # needed for the ML snapshot
+            )
+            ml_rows.append(snapshot_row(summary, edge_df, part_df, run_id=run_id))
+
+        append_rows(ml_rows)
+        total_rows += len(ml_rows)
+        if verbose:
+            print(f"  run {run_id}: appended {len(ml_rows)} ML rows "
+                  f"(run_id={run_id})")
+
+    if verbose:
+        print(f"\n[batch-B] {runs} seeded runs complete — {total_rows} ML rows "
+              f"in data/ml_training/master_traffic_features.csv")
+        print(f"[batch-B] playback JSON written from the final run only "
+              f"(under {SCN_ROOT})")
+    return total_rows
+
+
+# Back-compat alias (older callers / tests).
+def run_all(*, force: bool = False, verbose: bool = True, **_) -> list[dict]:
+    return run_standard_batch(force=force, verbose=verbose)
 
 
 def list_scenarios() -> pd.DataFrame:

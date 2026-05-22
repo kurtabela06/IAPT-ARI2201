@@ -237,6 +237,12 @@ class _EngineState:
     # Source queue per inflow edge — vehicles waiting to enter when cell 0
     # is already saturated. Each item is a Particle (count + class).
     source_queue: dict[str, list[Particle]]    = field(default_factory=dict)
+    # Seed-driven per-bin injection schedule cache.
+    # Key: (bin_idx, edge_label) → list[ (second_offset, cls) ] giving the
+    # exact second each vehicle unit spawns and its class. Built once per
+    # bin from the scenario RNG so a different seed → different spawn order
+    # and timing (Mode B stochastic requirement).
+    injection_schedule: dict[tuple[int, str], list[tuple[int, str]]] = field(default_factory=dict)
 
 
 def _init_state(g: nx.DiGraph, cfg: dict, rng=None) -> _EngineState:
@@ -432,43 +438,75 @@ def _largest_remainder(n: int, weights: list[float]) -> list[int]:
     return base
 
 
-def _inject_pulse_smeared(state: _EngineState, pulse: dict, *,
-                          scaling: float, offset_in_bin: int,
-                          bin_secs: int) -> None:
+def _build_bin_schedule(state: _EngineState, pulse: dict, *,
+                        scaling: float, bin_idx: int, bin_secs: int,
+                        rng) -> None:
     """
-    Spread a 1-minute demand pulse uniformly across `bin_secs` seconds and
-    across the network's inflow edges (weighted by their free-flow capacity).
+    Build the per-second spawn schedule for one demand bin, for every inflow
+    edge, and cache it in state.injection_schedule keyed by (bin_idx, edge).
 
-    Per call we inject exactly the slice of the bin that corresponds to
-    `offset_in_bin` (0..bin_secs-1). Apportionment is computed in two stages:
-      1. n_per_edge[cls][lbl]  = bin total for cls, distributed across edges
-      2. n_per_second[cls][lbl] = the (edge×class) total, distributed across
-                                  the bin's seconds.
-    Both stages use largest-remainder rounding so per-bin totals are exact.
+    Determinism vs. stochasticity:
+      • The per-bin TOTAL per class is exact (largest-remainder by edge).
+      • The exact SECOND each vehicle spawns within the bin is drawn from
+        `rng` — so a different scenario seed yields different spawn timing.
+      • The class ORDER within a second is shuffled by `rng`, so Cars vs.
+        HGVs interleave differently per seed.
+    This realises the Mode-B stochastic rule (seed varies spawn second +
+    car/HGV order). When rng is the fixed default seed, two runs are
+    identical (Mode A reproducibility).
     """
     inflow_labels = state.g.graph.get("inflow_edges", [])
     if not inflow_labels:
         return
-
     caps_for_lbl = []
     for lbl in inflow_labels:
         _, _, d = _edge_data_by_label(state.g, lbl)
         caps_for_lbl.append(d["max_occupancy_m"])
 
-    for cls in VEHICLE_CLASSES:
-        n_total = int(round(pulse.get(cls, 0) * scaling))
-        if n_total <= 0:
-            continue
-        per_edge = _largest_remainder(n_total, caps_for_lbl)
-        for lbl, edge_total in zip(inflow_labels, per_edge):
-            if edge_total <= 0:
+    for li, lbl in enumerate(inflow_labels):
+        events: list[tuple[int, str]] = []   # (second_offset, cls)
+        for cls in VEHICLE_CLASSES:
+            n_total = int(round(pulse.get(cls, 0) * scaling))
+            if n_total <= 0:
                 continue
-            seconds_w = [1.0] * bin_secs
-            per_sec = _largest_remainder(edge_total, seconds_w)
-            n_now = per_sec[offset_in_bin]
+            per_edge = _largest_remainder(n_total, caps_for_lbl)
+            edge_total = per_edge[li]
+            for _ in range(edge_total):
+                sec = rng.randint(0, bin_secs - 1)   # seed-driven spawn second
+                events.append((sec, cls))
+        # Shuffle so Cars/HGVs interleave per seed, then group by second.
+        rng.shuffle(events)
+        state.injection_schedule[(bin_idx, lbl)] = events
+
+
+def _inject_pulse_smeared(state: _EngineState, pulse: dict, *,
+                          scaling: float, offset_in_bin: int,
+                          bin_secs: int, bin_idx: int, rng) -> None:
+    """
+    Inject the slice of bin `bin_idx` that lands on `offset_in_bin`.
+
+    The whole bin's spawn schedule is built once (seed-driven) the first
+    time the bin is seen, then this function just dispatches the events
+    whose second matches `offset_in_bin`.
+    """
+    inflow_labels = state.g.graph.get("inflow_edges", [])
+    if not inflow_labels:
+        return
+
+    # Build the bin schedule lazily on first tick of the bin.
+    if (bin_idx, inflow_labels[0]) not in state.injection_schedule:
+        _build_bin_schedule(state, pulse, scaling=scaling,
+                            bin_idx=bin_idx, bin_secs=bin_secs, rng=rng)
+
+    for lbl in inflow_labels:
+        events = state.injection_schedule.get((bin_idx, lbl), [])
+        # Aggregate this-second's events into per-class counts.
+        per_cls: dict[str, int] = {}
+        for sec, cls in events:
+            if sec == offset_in_bin:
+                per_cls[cls] = per_cls.get(cls, 0) + 1
+        for cls, n_now in per_cls.items():
             if n_now > 0:
-                # Park in the source queue; the main loop drains it into cell 0
-                # subject to backpressure.
                 state.source_queue[lbl].append(
                     Particle(cls=cls, count=n_now, pos_m=0.0)
                 )
@@ -649,7 +687,8 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
             _inject_pulse_smeared(state, scenario.pulses[pulse_idx],
                                   scaling=scaling,
                                   offset_in_bin=t % bin_secs,
-                                  bin_secs=bin_secs)
+                                  bin_secs=bin_secs,
+                                  bin_idx=bin_idx, rng=rng)
 
         # ── 2b. Drain the source queue into cell 0 of each inflow ──────
         # Vehicles wait in the queue when cell 0 is saturated; each second

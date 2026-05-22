@@ -365,18 +365,13 @@ This produces the right visual: Main Way red and saturated; Escape running
 green/orange continuously; trunk and inflows orange/red as backpressure
 builds.
 
-### The 30-scenario grid (Q6 — restricted to filmed slots)
+### The scenario grid (restricted to filmed slots)
 
-```
-4 directions × 3 time slots × variants
-    regional: 3 variants  (all_open, 1_lane_closed, 2_lanes_closed)
-    valley:   2 variants  (all_open, 1_lane_closed)
-= 3 × (3 + 3 + 2 + 2) = 30 scenarios
-```
-
-Time slots are strictly the three we filmed in the field: **10am / 1pm /
-5pm**. No interpolation, no synthetic slots — the dataset reflects only
-what we collected. Each scenario writes three files:
+The base demand comes from the three time slots we filmed in the field:
+**10am / 1pm / 5pm** — no interpolation, no synthetic slots. The full grid
+is `4 directions × 3 slots × 3 horizons × variants = 162 scenarios`; see
+**CLI — Batch Simulation Suite** further below for the complete breakdown
+and the duration-specific cache layout. Each scenario writes three files:
 
 ```
 data/synthetic/scenarios/<direction>_<slot>_<variant>.csv             # telemetry  (sim_second × edge)
@@ -405,8 +400,10 @@ interpolate dot positions smoothly across cell boundaries.
 `cumulative_delay` is the Phase 4 ML target.
 
 ```bash
-# Pre-compute the whole 30-scenario library
+# Standard 1× batch (visual playback + run_id=1 ML rows)
 python simulation/scenarios.py --all
+# …or interactively: python main.py → [3] RUN STANDARD BATCH
+#                                      [4] RUN ML FACTORY BATCH (5× seeds)
 ```
 
 ### Visualisation (Q8 — abstract layout, currently)
@@ -464,78 +461,94 @@ Closing the window returns to the persistent CLI menu.
 A real-world top-down image overlay is planned for Phase 3 once the
 abstract layout is validated.
 
-### CLI drill-down (Options 1 and 3)
+### CLI — Batch Simulation Suite
 
 ```
-Level 1: Direction       (Regional N/S, Valley E/W)
-Level 2: Time slot       (10:00 AM / 1:00 PM / 5:00 PM — the filmed slots)
-Level 3: Base horizon H  (600 s / 900 s / 1200 s)
-Level 4: Mode
-            (A) Closure preview only  — runs to H
-            (B) Closure + Recovery    — runs to 2 × H
-Level 5: Variant / Transition
-            Mode A → all_open / 1_lane_closed / 2_lanes_closed   (regional)
-                     all_open / 1_lane_closed                    (valley)
-            Mode B (Regional) → 2closed_to_1closed (2 lanes closed → 1 lane closed)
-                                2closed_to_0closed (2 lanes closed → fully reopened)
-                                1closed_to_0closed (1 lane closed  → fully reopened)
-            Mode B (Valley)   → 1closed_to_0closed (1-lane road fully reopens)
+=========================================================
+      MALTA DIGITAL TWIN - BATCH SIMULATION SUITE
+=========================================================
+[1] View a Single Scenario (Static Closure Preview)
+[2] View a Single Scenario (Closure & Opening Recovery Preview)
+    --> sub-menu offers transitions (2->1, 2->0, 1->0) by road
+[3] RUN STANDARD BATCH   (1x — visual precomputations only)
+[4] RUN ML FACTORY BATCH (5x multi-seed — purges + 5x ML data)
+[5] TRAIN ML MODEL       (placeholder — reads CSV, exports .pkl)
+[6] Quit
+=========================================================
 ```
 
-Cache layout uses **duration-specific subfolders**:
+Options **[1]** and **[2]** drill down: Direction → Time slot → Horizon →
+Variant/Transition. The mode is fixed by the menu entry ([1] = static
+closure, [2] = closure + recovery), and the last level's sub-menu adapts
+to the road type:
 
 ```
-data/synthetic/scenarios/600s/<scenario>.{csv, json, particles.csv}     # Mode A, H=600    (30 scenarios)
-data/synthetic/scenarios/900s/<scenario>.{csv, …}                       # Mode A, H=900    (30 scenarios)
-data/synthetic/scenarios/1200s/<scenario>.{csv, …}                      # Mode A, H=1200 + Mode B, H=600  (54 scenarios)
-data/synthetic/scenarios/1800s/<scenario>.{csv, …}                      # Mode B, H=900    (24 scenarios)
-data/synthetic/scenarios/2400s/<scenario>.{csv, …}                      # Mode B, H=1200   (24 scenarios)
+Regional (RSB/RNB) recovery transitions:
+    2closed_to_1closed   2 lanes closed → 1 lane closed
+    2closed_to_0closed   2 lanes closed → fully reopened
+    1closed_to_0closed   1 lane closed  → fully reopened
+Valley (VEB/VWB) recovery transition:
+    1closed_to_0closed   1-lane road fully reopens
 ```
 
-**Total: 162 scenarios** — the full grid covers every combination the CLI
-drill-down can reach (`4 directions × 3 slots × 3 horizons × variants`).
-Run `python simulation/scenarios.py --all` to populate the cache. The batch
-runner also rebuilds the ML feature CSV at the end (see below).
-
-### ML feature snapshots (Phase 4 input)
-
-After every batch pre-compute, the engine extracts one **feature snapshot
-per scenario** at `T = base_horizon_s` — the moment of reopening for
-Mode B, the end of the closure phase for Mode A. All snapshots aggregate
-into a single CSV:
+Cache layout uses **duration-specific subfolders** (file isolation —
+playback JSON lives here, never mixed with the ML CSV):
 
 ```
-data/ml_training/recovery_stats.csv
+data/synthetic/scenarios/600s/   Mode A, H=600    (30 scenarios)
+data/synthetic/scenarios/900s/   Mode A, H=900    (30 scenarios)
+data/synthetic/scenarios/1200s/  Mode A, H=1200 + Mode B, H=600  (54)
+data/synthetic/scenarios/1800s/  Mode B, H=900    (24 scenarios)
+data/synthetic/scenarios/2400s/  Mode B, H=1200   (24 scenarios)
 ```
 
-Schema (one row per scenario, 162 rows total):
+**162 scenarios** total — the full grid (`4 directions × 3 slots ×
+3 horizons × variants`).
 
-| column                  | description                                                       |
-| ----------------------- | ----------------------------------------------------------------- |
-| `road_id`               | direction (regional_north / regional_south / valley_east / valley_west) |
-| `network_key`           | RNB / RSB / VEB / VWB                                             |
-| `slot`                  | 10am / 1pm / 5pm                                                  |
-| `base_horizon_s`        | 600 / 900 / 1200 (H)                                              |
-| `horizon_s`             | actual run length (H for Mode A, 2H for Mode B)                   |
-| `mode`                  | closure_only / recovery                                           |
-| `transition_type`       | e.g. `1_lane_closed`, `2closed_to_1closed`                        |
-| `snapshot_time_s`       | T = base_horizon_s                                                |
-| `total_occupied_meters` | Σ occupied_m across all edges at T (5m × cars + 8m × HGVs)        |
-| `queue_length_m`        | contiguous "red" cell run-length backwards from the trunk's diverge end |
-| `current_inflow_rate`   | vehicles/s being injected at T                                    |
-| `hgv_percentage`        | HGV share of (cars + HGV) on the network at T                     |
-| `recovery_threshold_kph` | network's V_avg target (60 Regional / 45 Valley)                 |
-| `recovery_triggered_s`  | T value used by the engine (None for Mode A)                      |
-| `time_to_recovery`      | **ML label** — seconds from T until rolling V_avg ≥ threshold; null if not recovered within horizon |
-| `scenario_csv`          | provenance path back to the source telemetry CSV                  |
+### Decoupled batch processing
 
-Run on-demand (without re-simulating) via:
+Visual-playback generation and ML-training-set generation are deliberately
+separate concerns:
 
-```bash
-python simulation/build_features.py
-```
+**[3] STANDARD BATCH (1× run)** — `run_standard_batch()`
+- Iterates the full matrix **once** with the fixed default seed.
+- Writes the detailed timestamp-by-timestamp playback files into the
+  `…s/` subfolders (reuses cached files unless `force`).
+- Purges `data/ml_training/` then appends **exactly one** snapshot set
+  (`run_id = 1`) to `master_traffic_features.csv`.
 
-Or interactively from the CLI menu — **Option 4: Rebuild ML feature snapshots**.
+**[4] ML FACTORY BATCH (5× multi-seed loop)** — `run_ml_factory_batch()`
+- Purges `data/ml_training/` first (Prompt 1 — stale csv/parquet removed;
+  scenario JSON is untouched).
+- Runs the entire matrix **5 times**, each with a distinct seed. The seed
+  varies (a) the exact second each vehicle spawns, (b) the Car/HGV spawn
+  order, and (c) the 20–30 % merge-friction penalty over the first 30 m of
+  every junction (RSB/RNB/VEB/VWB).
+- **Runs 1–4 are fully headless in memory** (no JSON/CSV written — avoids
+  bloat). **Only the 5th run** writes the playback files.
+- **Every run** appends its `T = base_horizon_s` snapshot to
+  `master_traffic_features.csv` with a `run_id` column (1–5), so the
+  dataset is `5 × 162 = 810` rows.
+
+### ML training set — `data/ml_training/master_traffic_features.csv`
+
+One row per (scenario × run). Schema matches the Scikit-Learn contract:
+
+| column                       | type    | description                                              |
+| ---------------------------- | ------- | -------------------------------------------------------- |
+| `run_id`                     | int     | seed/run index (1 for Mode A; 1–5 for Mode B)            |
+| `road_id`                    | string  | regional_north / regional_south / valley_east / valley_west |
+| `time_slot`                  | string  | 10am / 1pm / 5pm                                         |
+| `transition_type`            | string  | all_open / 1_lane_closed / 2closed_to_1closed / …        |
+| `spatial_occupancy_ratio`    | float   | network occupied_m ÷ network capacity_m at T             |
+| `hgv_ratio`                  | float   | HGV ÷ (cars + HGV) on the network at T                   |
+| `backpressure_segment_count` | int     | # of edge-cells in the "red" (>80 %) band at T           |
+| `escape_flow_rate`           | float   | veh/s exiting via the escape edges at T                  |
+| `recovery_time_seconds`      | float   | **target** — seconds from T until rolling V_avg ≥ threshold; **null** if not recovered within the horizon (downstream ML treats these as censored — they are not extrapolated) |
+
+Snapshot time `T = base_horizon_s` (the moment of reopening for recovery
+scenarios; the end of the closure phase for static-closure scenarios). The
+old `recovery_stats.csv` has been retired in favour of this contract.
 
 When "View pre-computed" doesn't find a scenario, the warning prints the
 exact expected path so you can see whether the bug is the missing run or a

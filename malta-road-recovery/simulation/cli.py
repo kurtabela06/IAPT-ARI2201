@@ -111,125 +111,119 @@ def _select_from(options: list[tuple[str, str]],
         print("Invalid choice. Try again.")
 
 
-def _drill_down(*, action_label: str) -> tuple[str, str, int, str, str] | None:
+def _drill_down(*, action_label: str, fixed_mode: str
+                ) -> tuple[str, str, int, str, str] | None:
     """
-    Walk the user through the 5-level drill-down. Returns
-    (direction, slot, base_h, mode, variant_or_transition) or None if backed out.
+    Walk the user through Direction → Slot → Horizon → (variant|transition).
+    `fixed_mode` is set by the menu entry (closure-only or recovery), so the
+    user is not asked to pick a mode — the sub-menu at the last level adapts
+    to the road type automatically.
     """
     direction = _select_from(
         [(k, v) for k, v in DIRECTION_LABEL.items()],
-        title=f"{action_label} — Level 1: pick a direction",
+        title=f"{action_label} — pick a road / direction",
     )
     if direction is None: return None
 
     slot = _select_from(
         [(s, SLOT_LABEL.get(s, s)) for s in TIME_SLOTS],
-        title=f"{DIRECTION_LABEL[direction]} — Level 2: pick a time slot",
+        title=f"{DIRECTION_LABEL[direction]} — pick a time slot",
     )
     if slot is None: return None
 
     base_h = _select_from(
-        [(str(h), f"H = {h} s  ({h//60} minutes)") for h in BASE_HORIZONS],
-        title=f"{slot} — Level 3: pick the base horizon H",
+        [(str(h), f"{h} s  ({h//60} min closure"
+                  + (f" + {h//60} min recovery)" if fixed_mode == MODE_RECOVERY else ")"))
+          for h in BASE_HORIZONS],
+        title=f"{slot} — Select Simulation Horizon",
     )
     if base_h is None: return None
     base_h = int(base_h)
 
-    mode = _select_from(
-        [(MODE_CLOSURE_ONLY, MODE_LABEL[MODE_CLOSURE_ONLY]),
-         (MODE_RECOVERY,     MODE_LABEL[MODE_RECOVERY])],
-        title=f"H = {base_h}s — Level 4: pick a mode",
-    )
-    if mode is None: return None
-
-    if mode == MODE_CLOSURE_ONLY:
+    if fixed_mode == MODE_CLOSURE_ONLY:
         variants = closure_variants_for(direction)
         vot = _select_from(
             [(v, VARIANT_LABEL.get(v, v)) for v in variants],
-            title=f"H = {base_h}s · Closure only — Level 5: pick an incident variant",
+            title=f"H = {base_h}s · Static Closure — pick the closure variant",
         )
-    else:   # MODE_RECOVERY
+    else:   # MODE_RECOVERY — transitions filtered by road type
         transitions = transitions_for(direction)
         vot = _select_from(
             [(t_key, TRANSITION_LABEL.get(t_key, t_key)) for t_key in transitions],
-            title=f"H = {base_h}s · Closure + Recovery — Level 5: pick a transition",
+            title=f"H = {base_h}s · Closure & Recovery — pick the lane transition",
         )
     if vot is None: return None
 
-    return direction, slot, base_h, mode, vot
+    return direction, slot, base_h, fixed_mode, vot
 
 
 # ---------------------------------------------------------------------------
 # Top-level menu actions
 # ---------------------------------------------------------------------------
 
-def _action_single_run() -> None:
-    sel = _drill_down(action_label="Single live run")
-    if sel is None: return
-    direction, slot, base_h, mode, vot = sel
-
-    print(f"\n→ running {direction} / {slot} / H={base_h}s / {mode} / {vot} live (force=True)…")
-    summary = run_one(direction, slot, base_h, mode, vot, force=True, verbose=True)
-    print("\nSummary:")
-    print(json.dumps(summary, indent=2))
-
-    csv_p, _, _ = output_paths(direction, slot, base_h, mode, vot)
-    if _ask("\nOpen the visualisation now? [y/N] ").lower().startswith("y"):
-        visualise_scenario(csv_p, direction=direction, slot=slot, variant=vot,
-                           summary=summary)
-
-
-def _action_precompute_all() -> None:
-    confirm = _ask(
-        "Pre-compute the full scenario grid (many combinations)? [y/N] "
-    )
-    if not confirm.lower().startswith("y"):
-        return
-    force = _ask("Force recomputation of cached scenarios? [y/N] ").lower().startswith("y")
-    summaries = run_all(force=force, verbose=True)
-    print(f"\nDone. {len(summaries)} scenarios written under {SCN_ROOT}.")
-    _ask("\nPress Enter to return to the main menu… ")
-
-
-def _action_view_scenario() -> None:
-    sel = _drill_down(action_label="View pre-computed scenario")
+def _preview_single(fixed_mode: str, action_label: str) -> None:
+    """Options [1]/[2] — single-scenario preview. Runs live (or reuses the
+    cached playback files if present) and opens the GUI."""
+    sel = _drill_down(action_label=action_label, fixed_mode=fixed_mode)
     if sel is None: return
     direction, slot, base_h, mode, vot = sel
 
     csv_p, json_p, _ = output_paths(direction, slot, base_h, mode, vot)
-    if not csv_p.exists() or not json_p.exists():
-        print(f"\n  Scenario data not found: {csv_p}")
-        print(f"  Please run Option 2 to pre-compute or select Option 1 for a live run.")
-        _ask("\nPress Enter to return… ")
-        return
-
-    summary = json.loads(json_p.read_text())
-    print("\n  Summary:")
+    if csv_p.exists() and json_p.exists():
+        print(f"\n→ using cached playback for {direction}/{slot}/H={base_h}s/{vot}")
+        summary = json.loads(json_p.read_text())
+    else:
+        print(f"\n→ running {direction} / {slot} / H={base_h}s / {mode} / {vot} live…")
+        summary = run_one(direction, slot, base_h, mode, vot,
+                          force=True, verbose=True)
+    print("\nSummary:")
     print(json.dumps(summary, indent=2))
-    visualise_scenario(csv_p, direction=direction, slot=slot, variant=vot,
-                       summary=summary)
+    if _ask("\nOpen the visualisation now? [Y/n] ").lower() not in ("n", "no"):
+        visualise_scenario(csv_p, direction=direction, slot=slot, variant=vot,
+                           summary=summary)
 
 
-def _action_build_features() -> None:
-    print("\n  Rebuilding ML feature snapshots from the scenario cache…")
-    try:
-        from simulation.build_features import build_all as _build_all
-        out = _build_all()
-        print(f"\n  Wrote → {out}")
-    except Exception as exc:
-        print(f"\n  Build failed: {exc}")
-    _ask("\nPress Enter to return… ")
+def _action_standard_batch() -> None:
+    print("\n  RUN STANDARD BATCH — 1× run, visual precomputations + 1 ML row set.")
+    confirm = _ask("  Proceed? This (re)builds all playback files. [y/N] ")
+    if not confirm.lower().startswith("y"):
+        return
+    force = _ask("  Force re-simulation of cached scenarios? [y/N] ").lower().startswith("y")
+    from simulation.scenarios import run_standard_batch
+    run_standard_batch(force=force, verbose=True)
+    _ask("\nPress Enter to return to the main menu… ")
+
+
+def _action_ml_factory_batch() -> None:
+    print("\n  RUN ML FACTORY BATCH — 5× multi-seed runs.")
+    print("  • Purges data/ml_training/ first (stale csv/parquet removed).")
+    print("  • Runs the full matrix 5× with distinct seeds.")
+    print("  • Runs 1–4 are headless; only the 5th writes JSON playback files.")
+    print("  • Every run appends its T-snapshot with a run_id (1–5).")
+    confirm = _ask("\n  This is heavy (5 × full matrix). Proceed? [y/N] ")
+    if not confirm.lower().startswith("y"):
+        return
+    from simulation.scenarios import run_ml_factory_batch
+    run_ml_factory_batch(verbose=True)
+    _ask("\nPress Enter to return to the main menu… ")
 
 
 def _action_train_ml() -> None:
-    print("\n  [Phase 4 stub] ML training not yet wired up.")
-    print("  data/ml_training/recovery_stats.csv is ready for downstream "
-          "XGBoost / RF / linear baselines.")
-    _ask("\nPress Enter to return… ")
-
-
-def _action_predict() -> None:
-    print("\n  [Phase 4 stub] Predictor not yet wired up.")
+    from simulation.build_features import MASTER_CSV
+    print("\n  TRAIN ML MODEL — [Phase 4 placeholder]")
+    if MASTER_CSV.exists():
+        import pandas as pd
+        df = pd.read_csv(MASTER_CSV)
+        print(f"  Found training set: {MASTER_CSV}")
+        print(f"    rows: {len(df)}   "
+              f"run_ids: {sorted(df['run_id'].unique()) if 'run_id' in df else '—'}")
+        print(f"    columns: {list(df.columns)}")
+        print("  Ready for a Scikit-Learn RandomForestRegressor "
+              "(features → recovery_time_seconds). Model export → model.pkl "
+              "is the next pipeline step.")
+    else:
+        print(f"  No training set found at {MASTER_CSV}.")
+        print("  Run Option [4] (ML Factory Batch) first.")
     _ask("\nPress Enter to return… ")
 
 
@@ -239,32 +233,35 @@ def _action_predict() -> None:
 
 def run_menu() -> None:
     while True:
-        _print_menu_header(
-            "Malta Road Recovery — Phase 2 Engine",
-            f"Cached scenarios: {count_scenarios()}",
-        )
-        print("  1. Run a single scenario (live)")
-        print("  2. Pre-compute all scenarios (batch)")
-        print("  3. View pre-computed scenario")
-        print("  4. Rebuild ML feature snapshots (recovery_stats.csv)")
-        print("  5. Train ML model on scenarios   [Phase 4 stub]")
-        print("  6. Predict on a new scenario     [Phase 4 stub]")
-        print("  7. Quit")
+        print()
+        print("=" * 57)
+        print("      MALTA DIGITAL TWIN - BATCH SIMULATION SUITE        ")
+        print("=" * 57)
+        print(f"  cached playback scenarios: {count_scenarios()}")
+        print("-" * 57)
+        print("[1] View a Single Scenario (Static Closure Preview)")
+        print("[2] View a Single Scenario (Closure & Opening Recovery Preview)")
+        print("    --> sub-menu offers transitions (2->1, 2->0, 1->0) by road")
+        print("[3] RUN STANDARD BATCH   (1x — visual precomputations only)")
+        print("[4] RUN ML FACTORY BATCH (5x multi-seed — purges + 5x ML data)")
+        print("[5] TRAIN ML MODEL       (placeholder — reads CSV, exports .pkl)")
+        print("[6] Quit")
+        print("=" * 57)
         choice = _ask("\n> ")
 
         if choice == "1":
-            _action_single_run()
+            _preview_single(MODE_CLOSURE_ONLY,
+                            "Static Closure Preview")
         elif choice == "2":
-            _action_precompute_all()
+            _preview_single(MODE_RECOVERY,
+                            "Closure & Opening Recovery Preview")
         elif choice == "3":
-            _action_view_scenario()
+            _action_standard_batch()
         elif choice == "4":
-            _action_build_features()
+            _action_ml_factory_batch()
         elif choice == "5":
             _action_train_ml()
-        elif choice == "6":
-            _action_predict()
-        elif choice in ("7", "q", "quit", "exit"):
+        elif choice in ("6", "q", "quit", "exit"):
             print("\nBye.\n")
             return
         else:
