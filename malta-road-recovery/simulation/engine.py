@@ -139,6 +139,12 @@ _DEFAULT_CFG = {
         "rolling_window_s":      30,
         "regional_threshold_kph": 60.0,
         "valley_threshold_kph":   45.0,
+        # Censored-data extrapolation: if the threshold is not met by the end
+        # of the horizon, fit a slope over the final `extrapolation_window_s`
+        # seconds of the rolling-speed curve and project the crossing time,
+        # capped at `extrapolation_cap_s`.
+        "extrapolation_window_s": 120,
+        "extrapolation_cap_s":    3600,
     },
 }
 
@@ -267,18 +273,22 @@ def _init_state(g: nx.DiGraph, cfg: dict, rng=None) -> _EngineState:
         st.accept_credit[lbl]    = 0.0
         st.source_queue[lbl] = []
 
-    # Transition Penalty: identify cells within the first `merge_zone_m` m
-    # of any edge whose source node has ≥ 2 inbound edges.
+    # Transition Penalty: drivers slow at every junction. Apply the 20-30 %
+    # speed reduction to the first `merge_zone_m` metres of any edge that
+    # leaves a junction node — i.e. whose SOURCE node is a merge (≥ 2 inbound
+    # edges) OR a diverge (≥ 2 outbound edges). This covers Flyover/Underpass
+    # merges on Regional, the Naxxar Road / Fleur-de-lys diverge+merge points
+    # on Valley, AND the escape-way diverges on Regional.
     for u, v, d in g.edges(data=True):
         lbl = d["label"]
-        n_in = g.in_degree(u)
-        if n_in < 2:
+        is_junction = (g.in_degree(u) >= 2) or (g.out_degree(u) >= 2)
+        if not is_junction:
             continue
         cell_len = st.cell_len[lbl]
         for ci in range(st.num_cells[lbl]):
             cell_start = ci * cell_len
             if cell_start < fz_m:
-                # Sample once per (edge, cell) for determinism.
+                # Sample once per (edge, cell) for determinism within a run.
                 if rng is not None:
                     factor = rng.uniform(fmin, fmax)
                 else:
@@ -933,6 +943,51 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
     if base_horizon_s is None:
         base_horizon_s = (scenario.recovery.start_s
                           if scenario.recovery is not None else horizon)
+
+    # ── Recovery time: observed, else censored-data extrapolation ─────────
+    # (Part-1 Audit 4) When a recovery was triggered but the rolling V_avg
+    # never reached the threshold within the horizon, fit a slope m over the
+    # final `extrapolation_window_s` seconds of the speed curve and project
+    # the crossing time; cap at `extrapolation_cap_s` (3600 s).
+    extrap_window = int(rec_cfg.get("extrapolation_window_s", 120))
+    extrap_cap    = float(rec_cfg.get("extrapolation_cap_s", 3600))
+    observed_recovery_time = (
+        (recovered_at - scenario.recovery.start_s)
+        if (recovered_at is not None and scenario.recovery is not None) else None
+    )
+    recovery_time_s = observed_recovery_time
+    recovery_was_extrapolated = False
+    if (recovery_time_s is None and scenario.recovery is not None
+            and len(speed_history) >= 2):
+        # Build the rolling-average series and take its last `extrap_window` s.
+        roll = []
+        for i in range(len(speed_history)):
+            lo = max(0, i - rolling_window + 1)
+            roll.append(sum(speed_history[lo:i+1]) / (i - lo + 1))
+        tail = roll[-extrap_window:] if len(roll) >= extrap_window else roll
+        if len(tail) >= 2:
+            n = len(tail)
+            xs = list(range(n))
+            mean_x = sum(xs) / n
+            mean_y = sum(tail) / n
+            denom = sum((x - mean_x) ** 2 for x in xs)
+            slope = (sum((xs[i] - mean_x) * (tail[i] - mean_y)
+                         for i in range(n)) / denom) if denom > 0 else 0.0
+            current_speed = tail[-1]
+            gap = recovery_kph_threshold - current_speed
+            if gap <= 0:
+                # Already at/above threshold on the very last sample.
+                recovery_time_s = float(horizon - scenario.recovery.start_s)
+            elif slope > 1e-6:
+                # seconds-from-end to reach threshold + time already elapsed
+                seconds_more = gap / slope
+                elapsed = horizon - scenario.recovery.start_s
+                recovery_time_s = float(min(elapsed + seconds_more, extrap_cap))
+            else:
+                # Flat or worsening — never recovers within a sane horizon.
+                recovery_time_s = float(extrap_cap)
+            recovery_was_extrapolated = True
+
     summary = {
         "network":           scenario.network_key,
         "direction":         scenario.direction,
@@ -952,9 +1007,10 @@ def simulate(scenario: Scenario, *, rng_seed: int = 42,
                                  if scenario.recovery is not None else None),
         "recovery_threshold_kph": recovery_kph_threshold,
         "recovered_at_s":      recovered_at,
-        "recovery_time_s":     ((recovered_at - scenario.recovery.start_s)
-                                if (recovered_at is not None
-                                    and scenario.recovery is not None) else None),
+        "recovery_time_s":     (round(recovery_time_s, 1)
+                                if recovery_time_s is not None else None),
+        "recovery_observed":   (observed_recovery_time is not None),
+        "recovery_extrapolated": recovery_was_extrapolated,
         "final_rolling_speed_kph": round(final_avg, 2),
     }
     return df, particles_df, summary

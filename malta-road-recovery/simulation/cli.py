@@ -209,21 +209,81 @@ def _action_ml_factory_batch() -> None:
 
 
 def _action_train_ml() -> None:
+    """[5] — run the full RandomForest training pipeline and show metrics."""
     from simulation.build_features import MASTER_CSV
-    print("\n  TRAIN ML MODEL — [Phase 4 placeholder]")
-    if MASTER_CSV.exists():
-        import pandas as pd
-        df = pd.read_csv(MASTER_CSV)
-        print(f"  Found training set: {MASTER_CSV}")
-        print(f"    rows: {len(df)}   "
-              f"run_ids: {sorted(df['run_id'].unique()) if 'run_id' in df else '—'}")
-        print(f"    columns: {list(df.columns)}")
-        print("  Ready for a Scikit-Learn RandomForestRegressor "
-              "(features → recovery_time_seconds). Model export → model.pkl "
-              "is the next pipeline step.")
-    else:
-        print(f"  No training set found at {MASTER_CSV}.")
-        print("  Run Option [4] (ML Factory Batch) first.")
+    print("\n  TRAIN ML MODEL — RandomForest recovery-time regressor")
+    if not MASTER_CSV.exists():
+        print(f"  No training set at {MASTER_CSV}.")
+        print("  Run Option [4] (ML Factory Batch) first to generate it.")
+        _ask("\nPress Enter to return… ")
+        return
+    try:
+        from ml.train_model import train
+        result = train(verbose=True)
+        print(f"\n  ✓ trained.  R²={result['r2']:.3f}  MAE={result['mae']:.1f}s  "
+              f"→ {result['model_path']}")
+    except Exception as exc:
+        import traceback
+        print(f"\n  Training failed: {exc}")
+        traceback.print_exc()
+    _ask("\nPress Enter to return… ")
+
+
+def _action_predict() -> None:
+    """[6] — Predictive Dashboard: pick params, run live inference."""
+    from ml.predict import predict_recovery, MODEL_PATH
+
+    if not MODEL_PATH.exists():
+        print(f"\n  No trained model at {MODEL_PATH}.")
+        print("  Run Option [5] (Train ML Model) first.")
+        _ask("\nPress Enter to return… ")
+        return
+
+    print("\n  PREDICTIVE DASHBOARD — instantaneous recovery-time inference")
+    direction = _select_from(
+        [(k, v) for k, v in DIRECTION_LABEL.items()],
+        title="Select Road & Direction",
+    )
+    if direction is None: return
+    slot = _select_from(
+        [(s, SLOT_LABEL.get(s, s)) for s in TIME_SLOTS],
+        title="Select Time Slot",
+    )
+    if slot is None: return
+    base_h = _select_from(
+        [("600", "10 minutes (600 s)"), ("900", "15 minutes (900 s)"),
+         ("1200", "20 minutes (1200 s)")],
+        title="Select Incident Duration",
+    )
+    if base_h is None: return
+    base_h = int(base_h)
+    # Transitions valid for that road (recovery transitions only).
+    transitions = transitions_for(direction)
+    transition = _select_from(
+        [(t, TRANSITION_LABEL.get(t, t)) for t in transitions],
+        title="Select Transition Type",
+    )
+    if transition is None: return
+
+    try:
+        out = predict_recovery(direction, slot, base_h, transition)
+    except Exception as exc:
+        print(f"\n  Prediction failed: {exc}")
+        _ask("\nPress Enter to return… ")
+        return
+
+    secs = out["predicted_seconds"]
+    print()
+    print("  " + "-" * 52)
+    print(f"  [ML PREDICTION] Predicted Road Recovery Time: "
+          f"{secs:.0f} seconds ({secs/60:.1f} minutes)")
+    print("  " + "-" * 52)
+    if out.get("baseline_source"):
+        print(f"  baseline conditions from: {out['baseline_source']}")
+    print(f"  inputs: occ_ratio={out['features']['spatial_occupancy_ratio']:.3f}  "
+          f"hgv={out['features']['hgv_ratio']:.3f}  "
+          f"backpressure={out['features']['backpressure_segment_count']}  "
+          f"escape={out['features']['escape_flow_rate']:.2f}")
     _ask("\nPress Enter to return… ")
 
 
@@ -244,8 +304,9 @@ def run_menu() -> None:
         print("    --> sub-menu offers transitions (2->1, 2->0, 1->0) by road")
         print("[3] RUN STANDARD BATCH   (1x — visual precomputations only)")
         print("[4] RUN ML FACTORY BATCH (5x multi-seed — purges + 5x ML data)")
-        print("[5] TRAIN ML MODEL       (placeholder — reads CSV, exports .pkl)")
-        print("[6] Quit")
+        print("[5] TRAIN ML MODEL       (RandomForest grid-search → .pkl)")
+        print("[6] PREDICT RECOVERY     (live inference dashboard)")
+        print("[7] Quit")
         print("=" * 57)
         choice = _ask("\n> ")
 
@@ -261,7 +322,9 @@ def run_menu() -> None:
             _action_ml_factory_batch()
         elif choice == "5":
             _action_train_ml()
-        elif choice in ("6", "q", "quit", "exit"):
+        elif choice == "6":
+            _action_predict()
+        elif choice in ("7", "q", "quit", "exit"):
             print("\nBye.\n")
             return
         else:

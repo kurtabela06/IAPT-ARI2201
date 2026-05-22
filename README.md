@@ -472,8 +472,9 @@ abstract layout is validated.
     --> sub-menu offers transitions (2->1, 2->0, 1->0) by road
 [3] RUN STANDARD BATCH   (1x — visual precomputations only)
 [4] RUN ML FACTORY BATCH (5x multi-seed — purges + 5x ML data)
-[5] TRAIN ML MODEL       (placeholder — reads CSV, exports .pkl)
-[6] Quit
+[5] TRAIN ML MODEL       (RandomForest grid-search → .pkl)
+[6] PREDICT RECOVERY     (live inference dashboard)
+[7] Quit
 =========================================================
 ```
 
@@ -539,12 +540,13 @@ One row per (scenario × run). Schema matches the Scikit-Learn contract:
 | `run_id`                     | int     | seed/run index (1 for Mode A; 1–5 for Mode B)            |
 | `road_id`                    | string  | regional_north / regional_south / valley_east / valley_west |
 | `time_slot`                  | string  | 10am / 1pm / 5pm                                         |
+| `incident_duration`          | int     | closure length in seconds (600 / 900 / 1200) = base horizon |
 | `transition_type`            | string  | all_open / 1_lane_closed / 2closed_to_1closed / …        |
 | `spatial_occupancy_ratio`    | float   | network occupied_m ÷ network capacity_m at T             |
 | `hgv_ratio`                  | float   | HGV ÷ (cars + HGV) on the network at T                   |
 | `backpressure_segment_count` | int     | # of edge-cells in the "red" (>80 %) band at T           |
 | `escape_flow_rate`           | float   | veh/s exiting via the escape edges at T                  |
-| `recovery_time_seconds`      | float   | **target** — seconds from T until rolling V_avg ≥ threshold; **null** if not recovered within the horizon (downstream ML treats these as censored — they are not extrapolated) |
+| `recovery_time_seconds`      | float   | **target** — observed seconds-to-recovery, OR (if the horizon ends first) a final-120 s slope extrapolation capped at 3600 s. Null only for closure-only rows (no reopening event). |
 
 Snapshot time `T = base_horizon_s` (the moment of reopening for recovery
 scenarios; the end of the closure phase for static-closure scenarios). The
@@ -553,6 +555,38 @@ old `recovery_stats.csv` has been retired in favour of this contract.
 When "View pre-computed" doesn't find a scenario, the warning prints the
 exact expected path so you can see whether the bug is the missing run or a
 wrong horizon selection.
+
+### ML suite — RandomForest recovery-time predictor
+
+**`ml/train_model.py`** (CLI **[5]**) trains a scikit-learn
+`RandomForestRegressor` to predict `recovery_time_seconds`:
+
+- Loads `master_traffic_features.csv`, drops null-target (closure-only) rows.
+- 80/20 train/test split (seeded).
+- Categoricals (`road_id`, `time_slot`, `transition_type`) → one-hot via a
+  `ColumnTransformer`. `incident_duration` stays **numeric** so the forest
+  learns the ordered "longer closure → worse residual queue" relation.
+- `GridSearchCV` over `n_estimators × max_depth × min_samples_split`,
+  scoring = neg-MAE.
+- Reports test R², MAE and feature importances; saves the fitted pipeline
+  (with metadata) via `joblib` to **`models/recovery_rf_model.pkl`**.
+
+**`ml/predict.py`** (CLI **[6]** — Predictive Dashboard) runs live
+inference. The dashboard prompts: Road & Direction → Time Slot → Incident
+Duration → Transition Type (filtered by road). It then loads the model,
+pulls the baseline traffic-state features for that exact configuration from
+`master_traffic_features.csv` (averaged across the seed runs), and prints:
+
+```
+[ML PREDICTION] Predicted Road Recovery Time: XXX seconds (X.X minutes)
+```
+
+Both are runnable standalone:
+
+```bash
+python ml/train_model.py
+python ml/predict.py regional_south 5pm 1200 2closed_to_1closed
+```
 
 ### Phase-aware GUI HUD
 
