@@ -1,467 +1,134 @@
-# IAPT-ARI2201 — Malta Road Recovery
+# Malta Road Recovery
 
-A traffic-flow & recovery-time analysis suite for Malta's Regional Road and
-Valley Road. Built on a **custom NetworkX simulation engine** (no SUMO) with
-Pandas state and Matplotlib visualisation.
+**A custom NetworkX-based traffic digital-twin and Random-Forest
+recovery-time predictor for the Triq Regionali and Valley Road corridors
+in Malta.**
 
----
-
-## Phases at a glance
-
-- **Phase 1 — Manual ground truth.** Observers fill one CSV per (direction × slot);
-  `data_processing/manual_to_pulse.py` reshapes them into 1-minute demand pulses.
-- **Phase 2 — Custom engine + scenario library.** Four NetworkX `DiGraph` road
-  skeletons, Greenshields with spatial-occupancy density, dynamic diversion at
-  escape exits / Naxxar pressure-valve, plus a 120-scenario synthetic dataset.
-- **Phase 3 — Visualiser.** Matplotlib heatmap + animated dots over the graph
-  layout; called interactively from the persistent CLI menu.
-- **Phase 4 — ML.** XGBoost / RF / linear baselines on the 120-scenario telemetry
-  to predict cumulative-delay recovery time. (Stub in the menu — future work.)
+*FYP submission, course IAPT-ARI2201. Kurt Abela, University of Malta.*
 
 ---
 
-## Phase 1 — Manual ground-truth extraction
+## 1. Project Abstract
 
-### Folder layout
+Maltese arterial roads — in particular Triq Regionali (Regional Road) and
+the Valley Road / Naxxar corridor — suffer disproportionate, persistent
+congestion whenever a lane is closed by an incident. There is currently
+no lightweight tool that a transport planner can run on a laptop to
+**estimate how long the road will take to recover** once the closure is
+lifted.
+
+This project delivers an end-to-end pipeline that:
+
+1. **Ingests manual vehicle counts** from filmed 10-minute observation
+   clips (per direction × time slot — 10:00 / 13:00 / 17:00).
+2. **Simulates** the closure and subsequent recovery on a calibrated
+   cell-transmission model of four distinct road sub-networks (Regional
+   N/S, Valley E/W), using a custom engine built on `networkx`, `pandas`
+   and `matplotlib`.
+3. **Generates a 5×-multi-seed synthetic dataset** of 810 scenario
+   snapshots taken at the exact moment the road reopens — the "ground
+   truth" for ML training.
+4. **Trains a `RandomForestRegressor`** (`sklearn`) to predict
+   `recovery_time_seconds` from the traffic state at reopening.
+5. **Serves the trained model** via a step-by-step interactive
+   prediction dashboard.
+
+### Architecture overview
 
 ```
-data/raw/manual_counts/
-    regional_north/<slot>.csv
-    regional_south/<slot>.csv
-    valley_east/<slot>.csv
-    valley_west/<slot>.csv
+┌──────────────────────────────────────────────────────────────────────┐
+│           data/raw/manual_counts/<direction>/<slot>.csv              │
+│                            (field counts)                            │
+└──────────────────┬───────────────────────────────────────────────────┘
+                   │   data_processing/manual_to_pulse.py
+                   ▼
+        data/processed/pulses/<direction>/<slot>.csv     (1-min demand pulses)
+                   │   simulation/calibrator.py
+                   ▼
+        data/processed/calibration/<…>.json              (per-slot scaling)
+                   │
+                   │   simulation/engine.py  (cell-transmission Greenshields engine)
+                   │   simulation/networks.py (4 hardcoded DiGraphs: RNB/RSB/VEB/VWB)
+                   │   simulation/scenarios.py (Mode A standard / Mode B 5× factory)
+                   ▼
+   data/synthetic/scenarios/<H>s/<scenario>.{csv,json,particles.csv}   (playback)
+                   │
+                   │   simulation/build_features.py
+                   ▼
+        data/ml_training/master_traffic_features.csv     (810 rows × 10 cols)
+                   │   ml/train_model.py
+                   ▼
+        models/recovery_rf_model.pkl                     (RF + grid search)
+                   │   ml/predict.py
+                   ▼
+   [ML INFERENCE PREDICTION SUITE]
+   * Query Parameters: RSB | 17:00 | 20-min Horizon | 2->1 State
+   * Predicted Post-Incident Recovery Time: 842 Seconds (14.0 Minutes)
 ```
 
-### CSV schema (one row per 1-minute bin)
+### Historical pivot — Why no SUMO?
 
-| column                | type  | required | description                                                      |
-| --------------------- | ----- | -------- | ---------------------------------------------------------------- |
-| timestamp_bin         | int   | yes      | 1-minute bin index (0, 1, 2, …)                                  |
-| car_count             | int   | yes      | Cars crossing the line in this bin                               |
-| motorcycle_count      | int   | no       | Motorcycles in this bin (defaults to 0 if column absent)         |
-| heavy_vehicle_count   | int   | yes      | Buses + trucks combined                                          |
-| avg_car_speed_kph     | float | yes      | Mean car speed observed for the bin (informational only)         |
-| incident_status       | str   | yes      | `clear` \| `slow` \| `blocked` \| `incident`                     |
+This project originally targeted SUMO (Simulator of Urban Mobility) as
+its physics engine. The pivot to a custom `networkx`-based engine was
+driven by:
 
-PCE / density / flow-rate are **not** stored in the CSV. The engine derives
-them on the fly from spatial occupancy on each graph edge.
+- **macOS / XQuartz environment friction** — SUMO's GUI binaries depend
+  on X11, which is awkward on Apple Silicon. Repeated GUI-render
+  failures during early calibration runs made iteration painfully slow.
+- **Transparency over abstraction** — for a dissertation it is more
+  defensible to write and explain the cell-transmission and merge-
+  friction physics than to wrap them in a third-party simulator whose
+  behaviour we can only treat as a black box.
+- **Zero-overhead install** — the final deliverable runs from
+  `pip install -r requirements.txt` and **needs nothing else** (no SUMO
+  binaries, no XQuartz, no `SUMO_HOME`).
 
-### Convert manual CSVs → demand pulses
+The pivot is fully documented in the git history and in
+`reports/validation_notes.md`.
+
+---
+
+## 2. Installation and Quickstart
+
+### Requirements
+
+- Python 3.10+ (tested on 3.12)
+- macOS / Linux / Windows — no platform-specific dependencies
+
+### One-command install
 
 ```bash
-cd malta-road-recovery
-python data_processing/manual_to_pulse.py --all
+git clone <repo-url>
+cd IAPT-ARI2201
+pip install -r requirements.txt
 ```
 
-Outputs land at `data/processed/pulses/<direction>/<slot>.csv` with the
-schema:
+`requirements.txt` brings in the entire dependency tree:
 
-```
-timestamp_bin, car, hgv, motorcycle, incident_status, observed_speed_kph
-```
+| package | role |
+| --- | --- |
+| `numpy`, `pandas`, `PyYAML` | data plumbing & config |
+| `networkx` | road-network graphs |
+| `matplotlib` | live playback visualiser + recovery HUD |
+| `scikit-learn`, `joblib` | RandomForest training & inference |
 
----
+There are **no external binaries to install** — no SUMO, no XQuartz, no
+`SUMO_HOME`, no GUI dependencies beyond stock Matplotlib.
 
-## Phase 2 — Custom NetworkX engine
-
-Phase 2 is **the core** of this project. Run it via:
+### Quickstart
 
 ```bash
 cd malta-road-recovery
 python main.py
 ```
 
-You'll see a persistent menu. Closing a visualisation always returns you to
-this menu; it never exits Python.
+This opens the persistent CLI menu (Section 3).
 
-```
-============================================================
-  Malta Road Recovery — Phase 2 Engine
-  Cached scenarios: 0
-============================================================
-  1. Run a single scenario (live)
-  2. Pre-compute all scenarios (batch)
-  3. View pre-computed scenario
-  4. Train ML model on scenarios   [Phase 4 stub]
-  5. Predict on a new scenario     [Phase 4 stub]
-  6. Quit
-```
+---
 
-### The four road skeletons
+## 3. Step-by-Step User Guide
 
-Each direction is a separate `networkx.DiGraph` with hardcoded geometry
-(metres) and lane counts. See `simulation/networks.py` for the literals.
-
-| Network | Description                          | Edges                                                                     |
-| ------- | ------------------------------------ | ------------------------------------------------------------------------- |
-| **RNB** | Regional Road Northbound             | mergeway_N_a (3L 140m) + underpass_N (1L 250m) → mergeway_N_b (3L 120m) → diverge → mainway_N (2L 465m) / escape_N (1L 465m) |
-| **RSB** | Regional Road Southbound             | flyover_S (2L 140m) + underpass_S (1L 140m) → mergeway_S (3L 235m) → diverge → mainway_S (2L 175m) / escape_S (1L 175m) |
-| **VEB** | Valley Road Eastbound                | valley_E (1L 180m) → branch → valley_cont_E (1L 350m) / **naxxar_E (1L 400m)** ← Pressure-Valve diversion |
-| **VWB** | Valley Road Westbound                | valley_W_pre (1L 370m) and (psaila_W + fleur_a_W → fleur_b_W) → junction → valley_W_post (1L 130m) — main stretch 500 m total |
-
-Every edge stores: `length_m`, `lanes`, `max_occupancy_m = length_m × lanes`,
-and `v_free_mps` (from posted speed limit).
-
-### Vehicle physics
-
-Spatial-occupancy Greenshields model:
-
-```
-occupied_m = car_count × 5 + hgv_count × 8           (motorcycles excluded)
-ratio      = occupied_m / max_occupancy_m
-v_car_hgv  = v_free × (1 − ratio)         (≥ min_speed_mps floor)
-v_moto     = v_free                       (always — queue-filtering)
-```
-
-Configurable via `config/simulation.yaml`:
-
-| key                                          | default    |
-| -------------------------------------------- | ---------- |
-| `vehicles.car.length_m` / `hgv` / `moto`    | 5 / 8 / 0.5 |
-| `greenshields.min_speed_mps`                | 0.5        |
-| `engine.step_s` / `horizon_s` / `bin_seconds` | 1 / 600 / 60 |
-| `engine.closure_start_s`                    | 60         |
-| `engine.cell_length_m`                      | 100.0      |
-| `engine.per_lane_acceptance_per_s`          | 0.6        |
-| `closure.partial_throughput_factor`         | 0.5        |
-| `backpressure.downstream_threshold`         | 0.90       |
-| `diversion.baseline_share`                  | 0.07       |
-| `diversion.saturation_threshold`            | 0.80       |
-| `diversion.max_divert_share`                | 0.40       |
-| `diversion.weight_growth_k`                 | 8.0        |
-
-### Demand calibration (Q4 — fixed-injection rule)
-
-For each (direction × slot) the **All-Lanes-Open** scenario calibrates an
-**injection count**: a multiplicative scaling on the manual pulse such that
-the simulated exit count matches the manual CSV total.
-
-That same injection count is then **reused unchanged** by the closure
-variants — so when you compare "all_open" vs "1_lane_closed" the only
-thing that differs is the closure mechanics, never the demand. This gives
-you a clean signal for **recovery time**: how long it takes the closed
-variant's exit flow to return to the all-open baseline once the closure is
-lifted.
-
-Cached at `data/processed/calibration/<direction>_<slot>_injection.json`.
-
-```bash
-# Calibrate just one slot
-python simulation/calibrator.py --direction regional_north --slot 10am --verbose
-```
-
-### Cell-transmission engine
-
-Every edge is subdivided into equal-length **cells** (default ~100 m each),
-configurable via `engine.cell_length_m`. Each cell holds its own particle
-list and computes its own Greenshields speed from its own occupancy. This
-is what makes the visible **speed gradient** along a long edge possible:
-free flow at the entry of `valley_W_pre`, slow-down approaching the
-bottleneck at the far end.
-
-State shape: `state.cells[edge_label][cell_idx] : list[Particle]`. Each
-particle carries `(class, count, pos_m_in_cell)`. Particles cross from
-cell `i` to cell `i+1` when their `pos_m` exceeds the cell length;
-particles in the last cell cross to the first cell of the next edge
-(routing chosen by `_choose_next_edge`).
-
-### Backpressure (spatial, ripple effect)
-
-Each second the engine performs a two-pass update **per cell**:
-
-1. **Advance pass.** Every particle moves at its cell's Greenshields-derived
-   speed (motorcycles always at v_free). Particles that reach the end of a
-   cell are parked at `pos_m = cell_length` and queued for transfer to the
-   chosen downstream cell (next cell on the same edge, or first cell of
-   the next edge).
-
-2. **Capacity-capped transfer.** For each receiving cell, the engine
-   accepts particles in arrival order while available spatial slack
-   remains. Below the configurable backpressure threshold
-   (`backpressure.downstream_threshold`, default 0.90) transfers are free
-   — natural arrivals are paced by the cell-traversal time on the source.
-   At/above the threshold, the engine caps each transfer by the
-   remaining `available_m`: accepted vehicles enter the target at
-   `pos_m = 0`; **rejected vehicles park at the source cell's end** and
-   accrue `cumulative_delay`. Their occupancy counts on the source cell,
-   which raises the source's saturation, which then back-propagates the
-   same way through the upstream cell, all the way to the entry edge.
-
-3. **Source queue.** Vehicles arriving from manual demand wait in a
-   per-edge `source_queue` if cell 0 of their inflow edge is already
-   saturated. Each second the engine drains the queue into cell 0 subject
-   to backpressure. This is how the **merge bottleneck (item 3a)**
-   manifests: when the trunk's first cell saturates, both inflow edges'
-   first cells back up, then their source queues. Mass is preserved
-   exactly: every vehicle is either still queued at its source, still in
-   the network, or counted in `exit_total` / `escape_total`.
-
-4. **Hard closure.** When `effective_lanes = 0`, every downstream-bound
-   transfer is rejected. If no alternative edge exists, particles park on
-   the upstream cell and accrue delay until the closure lifts.
-
-5. **Demand smearing.** Each minute's pulse is spread uniformly across
-   the 60 seconds of the bin so injection looks like a steady stream
-   rather than a sudden burst. Largest-remainder rounding preserves bin
-   totals exactly.
-
-### Closures act on the Main Way only
-
-Closures (`1_lane_closed`, `2_lanes_closed`, `full_closure`) reduce
-`effective_lanes` strictly on the **post-diverge Main Way** edge — never the
-trunk and never the escape. That keeps the diverge node reachable so traffic
-can peel off to the escape route while the Main Way fills with stranded cars.
-Per network:
-
-| Network | Closeable edge | Reduces lanes |
-| --- | --- | --- |
-| RNB | `mainway_N`     | 2 → 1 / 0 |
-| RSB | `mainway_S`     | 2 → 1 / 0 |
-| VEB | `valley_cont_E` | 1 → 0     |
-| VWB | `valley_W_post` | 1 → 0 (no escape route exists) |
-
-### Recovery API and extended horizons
-
-The engine accepts a dynamic `horizon_s` per `Scenario` (default 600 s).
-Spec-supported values: 600, 900, 1200, 1800, 2400 s. The "Closure + Recovery"
-mode runs for `2 × H` seconds: closure phase 0 → H, recovery phase H → 2H.
-
-**Looped CSV inflow**: when the horizon exceeds the manual CSV's bin count,
-the engine **loops** the CSV back to bin 0. So a 1800 s recovery run cycles
-through the 10 manual bins ~3 times. Demand is *not* artificially reduced
-during the recovery phase — a queue forming during closure has to drain
-against the same realistic demand pattern that produced it.
-
-A `RecoveryPolicy(start_s, new_lane_count)` attached to a `Scenario`
-triggers a mid-run lane swap. Example:
-
-```python
-from simulation.engine import Scenario, RecoveryPolicy, simulate
-
-sc = Scenario(
-    network_key="RSB", direction="regional_south", slot="5pm",
-    variant="1_lane_closed",        # closure starts at t=60
-    pulses=pulses,
-    horizon_s=1200,                  # extended horizon
-    recovery=RecoveryPolicy(start_s=600, new_lane_count=2),  # full reopen at t=600
-)
-df, particles_df, summary = simulate(sc)
-print(summary["recovery_time_s"])     # seconds elapsed from trigger to V_avg ≥ threshold
-```
-
-**Recovery thresholds** (network-wide vehicle-weighted rolling-average
-speed, configurable in `simulation.yaml`):
-
-| Network | Threshold |
-| --- | --- |
-| Regional (RNB / RSB) | 60 km/h |
-| Valley (VEB / VWB)   | 45 km/h |
-
-The summary dict surfaces:
-
-| Key | Description |
-| --- | --- |
-| `horizon_s` | The horizon actually used (override or config default) |
-| `recovery_triggered_s` | When the lane swap fired (or `None`) |
-| `recovery_threshold_kph` | The threshold used for this network |
-| `recovered_at_s` | First sim_second after trigger when rolling V_avg ≥ threshold |
-| `recovery_time_s` | `recovered_at_s − recovery_triggered_s` |
-| `final_rolling_speed_kph` | Rolling V_avg over the last `rolling_window_s` (default 30) |
-
-### Transition Penalty (merge friction)
-
-Real merges slow traffic for the first ~30 m of the destination edge as
-drivers adjust. The engine applies a multiplicative speed penalty (drawn
-once per cell from `[speed_factor_min, speed_factor_max]`, default
-`[0.70, 0.80]` = 20–30 % reduction) to every cell that lies within
-`merge_zone_m` (default 30 m) of a merge-target edge — i.e. any edge
-whose source node has ≥ 2 inbound edges. Persists during both closure and
-recovery phases. Motorcycles are subject to the penalty too because real
-riders also slow at junctions, even though they don't contribute to
-occupancy density.
-
-Configuration knobs in `config/simulation.yaml`:
-
-| Key | Default |
-| --- | --- |
-| `merge_friction.merge_zone_m` | 30.0 |
-| `merge_friction.speed_factor_min` | 0.70 |
-| `merge_friction.speed_factor_max` | 0.80 |
-| `recovery.rolling_window_s` | 30 |
-| `recovery.regional_threshold_kph` | 60.0 |
-| `recovery.valley_threshold_kph` | 45.0 |
-
-### Bottleneck-cap acceptance accumulator
-
-The Bottleneck Penalty's per-second cap is a *fractional* rate (e.g. 0.6
-veh/s for a 2L→1L closure). The engine implements this via a **per-edge
-acceptance-credit accumulator**:
-
-- Each tick adds `partial_cap` worth of credit to the edge's credit pool.
-- Each accepted contributing vehicle consumes 1.0 credit.
-- The pool is bounded by `credit_buffer_s × cap` (default 3 seconds of
-  saved-up throughput) so unused capacity does not accumulate
-  indefinitely. Without this cap, a road that sat empty for a while
-  would suddenly accept dozens of vehicles in one tick when demand
-  arrived — which produced inconsistent behaviour between
-  steady-state and post-recovery runs that share the same effective_lanes.
-- Vehicles arrive but credit is empty → particle stays parked on the
-  upstream cell, contributes to backpressure.
-
-This is what makes the partially-reopened lane during recovery absorb
-traffic identically to a steady-state partially-closed road. An earlier
-implementation used `int(partial_cap)` which silently quantised 0.6 veh/s
-to 0 — the open lane looked closed because it accepted nothing per second.
-The credit accumulator fixes that: 0.6 + 0.6 = 1.2 → one vehicle accepted
-on the second tick, leaving 0.2 credit; average rate = 0.6 veh/s.
-
-### Bottleneck Penalty (2-lane partial closure)
-
-When a 2-lane edge has 1 lane closed (`effective_lanes < original_lanes`
-but `> 0`), the engine applies an explicit per-second acceptance cap on
-that edge's first cell:
-
-```
-partial_cap_per_s = original_lanes × per_lane_acceptance_per_s × partial_throughput_factor
-                  = 2 × 0.6 × 0.5 = 0.6 veh/s   (default)
-```
-
-This is the spec's "fixed throughput rate of 50 % of the original
-capacity." The `partial_throughput_factor` knob lives at
-`closure.partial_throughput_factor` in `simulation/simulation.yaml`.
-Combined with the diversion curve, ~50 % of arrivals at the diverge node
-are pushed to the escape route once Main Way saturates, while the
-remaining ~50 % trickle through the half-cap Main Way at v_free.
-
-### Dynamic diversion (Pressure-Valve, three-stage curve)
-
-The diversion share at each diverge node is a piecewise function of the
-**Main Way's whole-edge occupancy ratio** `ρ`:
-
-```
-Stage 1  (Normal)        ρ ≤ 0.80           share = 0.07         (5–10 % "local exiters")
-Stage 2  (Queue forming) 0.80 < ρ < 1.00    share = linear interp 0.07 → 0.40
-Stage 3  (High pressure) ρ ≥ 1.00           share = 0.40         (cap)
-```
-
-Default knobs (`config/simulation.yaml`):
-- `diversion.baseline_share = 0.07`
-- `diversion.saturation_threshold = 0.80`
-- `diversion.max_divert_share = 0.40`
-
-This single curve drives **all** escape diversion across the four networks:
-RNB/RSB escape ramps, the Naxxar Road Pressure-Valve on VEB. Motorcycles
-always pick the Main Way (queue-filtering — they don't experience the jam).
-
-**Why no forced-reroute around closed edges**: when the Main Way is closed
-(`effective_lanes = 0`), routing still picks Main vs Escape per the curve
-above. Particles that pick the closed Main Way park on the trunk's last cell
-and back-pressure ripples upstream. As Main Way occupancy stays at 100 %,
-the diversion share is pinned at 40 %, so a continuous **40 % stream of
-arrivals peels off to the escape** — exactly the spec's "red pile-up at end
-of Main Way + steady stream of orange/green dots through the escape."
-
-This produces the right visual: Main Way red and saturated; Escape running
-green/orange continuously; trunk and inflows orange/red as backpressure
-builds.
-
-### The scenario grid (restricted to filmed slots)
-
-The base demand comes from the three time slots we filmed in the field:
-**10am / 1pm / 5pm** — no interpolation, no synthetic slots. The full grid
-is `4 directions × 3 slots × 3 horizons × variants = 162 scenarios`; see
-**CLI — Batch Simulation Suite** further below for the complete breakdown
-and the duration-specific cache layout. Each scenario writes three files:
-
-```
-data/synthetic/scenarios/<direction>_<slot>_<variant>.csv             # telemetry  (sim_second × edge)
-data/synthetic/scenarios/<direction>_<slot>_<variant>.particles.csv   # particle positions  (sim_second × particle)
-data/synthetic/scenarios/<direction>_<slot>_<variant>.json            # summary
-```
-
-Telemetry schema (one row per `sim_second × edge`):
-
-```
-time_s, edge, occupancy_ratio, occupied_m, max_occupancy_m,
-speed_mps, speed_kph, cars_on_edge, hgv_on_edge, moto_on_edge,
-cumulative_delay, effective_lanes
-```
-
-Particles schema (one row per `sim_second × particle`):
-
-```
-time_s, edge, cls, count, pos_m, pos_frac, cell_idx
-```
-
-`pos_frac` is `pos_m / edge_length` (the *global* position along the edge,
-combining cell index + intra-cell position) — used by the visualiser to
-interpolate dot positions smoothly across cell boundaries.
-
-`cumulative_delay` is the Phase 4 ML target.
-
-```bash
-# Standard 1× batch (visual playback + run_id=1 ML rows)
-python simulation/scenarios.py --all
-# …or interactively: python main.py → [3] RUN STANDARD BATCH
-#                                      [4] RUN ML FACTORY BATCH (5× seeds)
-```
-
-### Visualisation (Q8 — abstract layout, currently)
-
-`simulation/visualizer.py` opens a Matplotlib window with a **hardcoded
-layout** (one per network — defined in `simulation/networks.py:NODE_LAYOUTS`)
-so each direction has a stable, topology-faithful node arrangement that
-will line up cleanly when real-world top-down images are added in Phase 3.
-Every edge and every particle is rendered concurrently in each 1-second
-frame, so split points (diverges) and merges are visible in real time.
-
-**Edge naming for academic clarity**: every edge carries a `display_name`
-attribute used by the visualizer label. Trunks are labelled "Regional Road"
-or "Valley Road"; inflows are "Entry 1", "Entry 2"… numbered in flow order;
-outflows are "Exit 1", "Exit 2"… same convention. Internal IDs (`mainway_N`,
-`flyover_S`, etc.) remain unchanged in the engine and telemetry CSVs so
-existing downstream code stays compatible.
-
-**Telemetry banner** at the top of the figure shows scenario name (e.g.
-`RSB • 5:00 PM • 1 Lane Closed`), current sim time (`t = 300 s / 600 s`),
-and a vehicle-weighted **network-mean speed** (km/h) recomputed every frame.
-
-**Line-style rules** per spec:
-
-| Edge state | Line style |
-| --- | --- |
-| Open / partially closed (any lanes ≥ 1) | Solid |
-| Fully closed (effective_lanes = 0) | Dashed black |
-
-Partially-closed edges also display a `½cap` tag next to their label so
-you can see at a glance which edges are the bottleneck.
-
-**Sectioned legend** on the right side: OCCUPANCY (colour scale) / LANE
-STATE (line styles) / VEHICLE CLASS (dot colours) / NOTES.
-
-| Range          | Edge colour |
-| -------------- | ----------- |
-| `< 40 %`       | green       |
-| `40 – 80 %`    | orange      |
-| `> 80 %`       | red         |
-| closed         | black, dashed |
-
-Particle dots are read directly from the `*.particles.csv` log, so a
-particle at `pos_frac = 0.62` shows up 62 % of the way along its edge —
-no jumps, no vanishing. Vehicle classes are colour-coded:
-
-| Class      | Dot colour |
-| ---------- | ---------- |
-| Car        | dark blue  |
-| HGV        | dark red   |
-| Motorcycle | navy       |
-
-Closing the window returns to the persistent CLI menu.
-
-A real-world top-down image overlay is planned for Phase 3 once the
-abstract layout is validated.
-
-### CLI — Batch Simulation Suite
+### The interactive suite
 
 ```
 =========================================================
@@ -478,149 +145,236 @@ abstract layout is validated.
 =========================================================
 ```
 
-Options **[1]** and **[2]** drill down: Direction → Time slot → Horizon →
-Variant/Transition. The mode is fixed by the menu entry ([1] = static
-closure, [2] = closure + recovery), and the last level's sub-menu adapts
-to the road type:
+### The recommended first-run order
+
+For a clean run from scratch:
+
+1. **Convert manual counts to demand pulses** (one-time setup, outside
+   the menu):
+
+   ```bash
+   python data_processing/manual_to_pulse.py --all
+   ```
+
+   This reads every `data/raw/manual_counts/<direction>/<slot>.csv` and
+   produces 1-minute pulse CSVs in `data/processed/pulses/`. The 5pm /
+   1pm / 10am field observations are already present.
+
+2. **Generate the 162-scenario playback library** — menu option **[3]**.
+   Iterates the full matrix once (seed = 42), writes the JSON / CSV /
+   particles files into `data/synthetic/scenarios/<H>s/`, and writes a
+   162-row `master_traffic_features.csv` tagged `run_id = 1`. Takes
+   ≈ 5 minutes.
+
+3. **Generate the 810-row multi-seed ML training set** — menu option
+   **[4]**. Purges `data/ml_training/` first, then runs the matrix 5
+   times with distinct seeds. Iterations 1–4 are *headless* (no JSON);
+   only iteration 5 writes the playback files. Every iteration appends
+   a snapshot row with its `run_id` ∈ {1, 2, 3, 4, 5}. Final CSV: 810
+   rows. Takes ≈ 5 minutes.
+
+4. **Train the RandomForest** — menu option **[5]**. Runs an 80/20 split,
+   `GridSearchCV` over `n_estimators × max_depth × min_samples_split`
+   minimising MAE, prints R² / MAE / feature importances, and writes
+   `models/recovery_rf_model.pkl`. Takes a few seconds.
+
+5. **Live prediction** — menu option **[6]**. Step-by-step prompts:
+   - Select Road & Direction (RNB / RSB / VEB / VWB)
+   - Select Time Slot (10:00 / 13:00 / 17:00)
+   - Select Incident Duration (10 / 15 / 20 min)
+   - Select Transition Type (only options valid for that road)
+
+   Outputs the `[ML INFERENCE PREDICTION SUITE]` banner with the
+   extracted baseline conditions and the predicted recovery time.
+
+### Visual scenario playback (options [1] and [2])
+
+Options [1] (static closure) and [2] (closure + opening recovery) drill
+through Direction → Slot → Horizon → Variant/Transition and open a live
+Matplotlib animation with:
+
+- Heatmap on every edge (Green < 40 % occupancy, Orange 40–80 %, Red > 80 %).
+- Line styles: **Solid** = open or partial closure, **Dotted** = full
+  closure.
+- Phase indicator (`STATUS: ACCIDENT PHASE` / `STATUS: RECOVERY PHASE`).
+- Continuous simulation clock and `Time Since Reopening` counter.
+- Recovery progress bar at the bottom (V_avg vs. target 60 / 45 km/h).
+- Vehicle dots colour-coded by class (cars / HGV / motorcycles) moving
+  along each edge at the calculated flow speed.
+
+Closing the Matplotlib window returns control to the menu — no Python
+restart needed.
+
+---
+
+## 4. Repository Layout
 
 ```
-Regional (RSB/RNB) recovery transitions:
-    2closed_to_1closed   2 lanes closed → 1 lane closed
-    2closed_to_0closed   2 lanes closed → fully reopened
-    1closed_to_0closed   1 lane closed  → fully reopened
-Valley (VEB/VWB) recovery transition:
-    1closed_to_0closed   1-lane road fully reopens
+IAPT-ARI2201/
+├── README.md                        ← (this file)
+├── requirements.txt
+└── malta-road-recovery/
+    ├── main.py                      ← entry point: launches the CLI suite
+    ├── config/
+    │   └── simulation.yaml          ← engine parameters (Greenshields,
+    │                                  merge friction, closure caps,
+    │                                  recovery thresholds, extrapolation)
+    ├── data_processing/
+    │   └── manual_to_pulse.py       ← field counts → 1-minute pulses
+    ├── simulation/
+    │   ├── networks.py              ← 4 hardcoded DiGraphs (RNB/RSB/VEB/VWB)
+    │   ├── engine.py                ← cell-transmission Greenshields engine
+    │   ├── calibrator.py            ← per-slot demand scaling
+    │   ├── scenarios.py             ← Mode A / Mode B batch drivers
+    │   ├── build_features.py        ← T = base_horizon snapshots → CSV
+    │   ├── visualizer.py            ← Matplotlib heatmap + HUD + animation
+    │   └── cli.py                   ← persistent 7-option menu
+    ├── ml/
+    │   ├── train_model.py           ← RandomForest + GridSearchCV + joblib
+    │   └── predict.py               ← real-time inference dashboard
+    ├── models/
+    │   └── recovery_rf_model.pkl    ← trained RF pipeline (≈ 200 KB)
+    ├── data/
+    │   ├── raw/
+    │   │   ├── manual_counts/       ← per-(direction, slot) field CSVs
+    │   │   ├── video/               ← source 10-min clips (.mp4)
+    │   │   └── osm/                 ← OpenStreetMap extract
+    │   ├── processed/
+    │   │   ├── pulses/              ← 1-min demand pulses
+    │   │   └── calibration/         ← per-slot scaling factors
+    │   ├── synthetic/
+    │   │   └── scenarios/
+    │   │       ├── 600s/   ← Mode A H=600
+    │   │       ├── 900s/   ← Mode A H=900
+    │   │       ├── 1200s/  ← Mode A H=1200 + Mode B H=600
+    │   │       ├── 1800s/  ← Mode B H=900
+    │   │       └── 2400s/  ← Mode B H=1200
+    │   └── ml_training/
+    │       └── master_traffic_features.csv   ← 810-row training set
+    └── reports/
+        ├── validation_notes.md      ← physics audit + formulas
+        ├── report_draft.md          ← dissertation skeleton
+        └── figures/{RNB,RSB,VEB,VWB}.png
 ```
+
+---
+
+## 5. The Four Road Sub-Networks
+
+Each is a `networkx.DiGraph` with hard-coded geometry calibrated against
+the filmed corridor.
+
+| Key | Display name | Topology |
+| --- | --- | --- |
+| **RNB** | Regional Road Northbound | Two inflows (Main + Underpass) → 3-lane trunk → diverge → Final Main (2L 465 m) / Escape (1L 465 m) |
+| **RSB** | Regional Road Southbound | Two inflows (Flyover + Underpass) → 3-lane trunk → diverge → Tunnel (2L 175 m) / Escape (1L 175 m) |
+| **VEB** | Valley Road Eastbound | Single inflow → branch → Valley Continuation (1L 350 m) / Naxxar Road escape (1L 400 m) |
+| **VWB** | Valley Road Westbound | Three inflows (Valley + Psaila + Fleur-de-lys) → merge → 1-lane exit |
+
+See `reports/figures/{RNB,RSB,VEB,VWB}.png` for the abstract layouts used
+by the visualiser.
+
+---
+
+## 6. The 162-Scenario Grid
+
+```
+4 directions × 3 time slots × 3 horizons × variants =  162 scenarios
+                                                   ×  5 seeds (Mode B)
+                                                  = 810 ML training rows
+```
+
+Variants per road type:
+
+| Road type | Closure-only variants | Recovery transitions |
+| --- | --- | --- |
+| Regional | `all_open`, `1_lane_closed`, `2_lanes_closed` | `2closed_to_1closed`, `2closed_to_0closed`, `1closed_to_0closed` |
+| Valley | `all_open`, `1_lane_closed` | `1closed_to_0closed` |
 
 Cache layout uses **duration-specific subfolders** (file isolation —
 playback JSON lives here, never mixed with the ML CSV):
 
 ```
-data/synthetic/scenarios/600s/   Mode A, H=600    (30 scenarios)
-data/synthetic/scenarios/900s/   Mode A, H=900    (30 scenarios)
-data/synthetic/scenarios/1200s/  Mode A, H=1200 + Mode B, H=600  (54)
-data/synthetic/scenarios/1800s/  Mode B, H=900    (24 scenarios)
-data/synthetic/scenarios/2400s/  Mode B, H=1200   (24 scenarios)
+data/synthetic/scenarios/600s/    Mode A, H=600    (30 scenarios)
+data/synthetic/scenarios/900s/    Mode A, H=900    (30 scenarios)
+data/synthetic/scenarios/1200s/   Mode A, H=1200 + Mode B, H=600  (54)
+data/synthetic/scenarios/1800s/   Mode B, H=900    (24 scenarios)
+data/synthetic/scenarios/2400s/   Mode B, H=1200   (24 scenarios)
 ```
-
-**162 scenarios** total — the full grid (`4 directions × 3 slots ×
-3 horizons × variants`).
-
-### Decoupled batch processing
-
-Visual-playback generation and ML-training-set generation are deliberately
-separate concerns:
-
-**[3] STANDARD BATCH (1× run)** — `run_standard_batch()`
-- Iterates the full matrix **once** with the fixed default seed.
-- Writes the detailed timestamp-by-timestamp playback files into the
-  `…s/` subfolders (reuses cached files unless `force`).
-- Purges `data/ml_training/` then appends **exactly one** snapshot set
-  (`run_id = 1`) to `master_traffic_features.csv`.
-
-**[4] ML FACTORY BATCH (5× multi-seed loop)** — `run_ml_factory_batch()`
-- Purges `data/ml_training/` first (Prompt 1 — stale csv/parquet removed;
-  scenario JSON is untouched).
-- Runs the entire matrix **5 times**, each with a distinct seed. The seed
-  varies (a) the exact second each vehicle spawns, (b) the Car/HGV spawn
-  order, and (c) the 20–30 % merge-friction penalty over the first 30 m of
-  every junction (RSB/RNB/VEB/VWB).
-- **Runs 1–4 are fully headless in memory** (no JSON/CSV written — avoids
-  bloat). **Only the 5th run** writes the playback files.
-- **Every run** appends its `T = base_horizon_s` snapshot to
-  `master_traffic_features.csv` with a `run_id` column (1–5), so the
-  dataset is `5 × 162 = 810` rows.
-
-### ML training set — `data/ml_training/master_traffic_features.csv`
-
-One row per (scenario × run). Schema matches the Scikit-Learn contract:
-
-| column                       | type    | description                                              |
-| ---------------------------- | ------- | -------------------------------------------------------- |
-| `run_id`                     | int     | seed/run index (1 for Mode A; 1–5 for Mode B)            |
-| `road_id`                    | string  | regional_north / regional_south / valley_east / valley_west |
-| `time_slot`                  | string  | 10am / 1pm / 5pm                                         |
-| `incident_duration`          | int     | closure length in seconds (600 / 900 / 1200) = base horizon |
-| `transition_type`            | string  | all_open / 1_lane_closed / 2closed_to_1closed / …        |
-| `spatial_occupancy_ratio`    | float   | network occupied_m ÷ network capacity_m at T             |
-| `hgv_ratio`                  | float   | HGV ÷ (cars + HGV) on the network at T                   |
-| `backpressure_segment_count` | int     | # of edge-cells in the "red" (>80 %) band at T           |
-| `escape_flow_rate`           | float   | veh/s exiting via the escape edges at T                  |
-| `recovery_time_seconds`      | float   | **target** — observed seconds-to-recovery, OR (if the horizon ends first) a final-120 s slope extrapolation capped at 3600 s. Null only for closure-only rows (no reopening event). |
-
-Snapshot time `T = base_horizon_s` (the moment of reopening for recovery
-scenarios; the end of the closure phase for static-closure scenarios). The
-old `recovery_stats.csv` has been retired in favour of this contract.
-
-When "View pre-computed" doesn't find a scenario, the warning prints the
-exact expected path so you can see whether the bug is the missing run or a
-wrong horizon selection.
-
-### ML suite — RandomForest recovery-time predictor
-
-**`ml/train_model.py`** (CLI **[5]**) trains a scikit-learn
-`RandomForestRegressor` to predict `recovery_time_seconds`:
-
-- Loads `master_traffic_features.csv`, drops null-target (closure-only) rows.
-- 80/20 train/test split (seeded).
-- Categoricals (`road_id`, `time_slot`, `transition_type`) → one-hot via a
-  `ColumnTransformer`. `incident_duration` stays **numeric** so the forest
-  learns the ordered "longer closure → worse residual queue" relation.
-- `GridSearchCV` over `n_estimators × max_depth × min_samples_split`,
-  scoring = neg-MAE.
-- Reports test R², MAE and feature importances; saves the fitted pipeline
-  (with metadata) via `joblib` to **`models/recovery_rf_model.pkl`**.
-
-**`ml/predict.py`** (CLI **[6]** — Predictive Dashboard) runs live
-inference. The dashboard prompts: Road & Direction → Time Slot → Incident
-Duration → Transition Type (filtered by road). It then loads the model,
-pulls the baseline traffic-state features for that exact configuration from
-`master_traffic_features.csv` (averaged across the seed runs), and prints:
-
-```
-[ML PREDICTION] Predicted Road Recovery Time: XXX seconds (X.X minutes)
-```
-
-Both are runnable standalone:
-
-```bash
-python ml/train_model.py
-python ml/predict.py regional_south 5pm 1200 2closed_to_1closed
-```
-
-### Phase-aware GUI HUD
-
-When the visualizer renders a scenario whose summary JSON includes
-`recovery_triggered_s`, the figure adds:
-
-- **Phase Indicator** (top-left, banner): `STATUS: ACCIDENT PHASE` (red)
-  while `t < base_horizon_s`, switching to `STATUS: RECOVERY PHASE` (teal)
-  the moment the recovery trigger fires.
-- **Time Since Reopening** (top-centre): `reopened: + N s` counter that
-  starts at 0 when the recovery trigger fires and increments each second.
-- **Transition Flash**: a yellow-bordered banner appears on the main map
-  for ~30 seconds after the trigger, displaying the human-readable
-  transition (e.g. *Recovery: 2 lanes closed → 1 lane reopens*). Fades to
-  zero opacity over the 30 s window.
-- **Recovery Progress Bar** (bottom strip): horizontal bar comparing
-  current network V_avg to the network's recovery threshold (60 km/h
-  Regional / 45 km/h Valley). Bar colour: red < 85 % of threshold, orange
-  approaching, green at/above. A dashed vertical marker shows the target
-  on the bar's axis.
-
-Closing a Matplotlib window returns control to the persistent CLI menu —
-no Python process exit.
-
-Selecting a not-yet-cached scenario prints:
-
-> _Scenario data not found. Please run Option 2 to pre-compute or select Option 1 for a live run._
 
 ---
 
-## Subsequent phases
+## 7. ML Training Set Contract
 
-- **Phase 3 — Real-world overlays.** Replace the abstract NetworkX layout
-  with georeferenced top-down images of the road segments.
-- **Phase 4 — ML.** Train recovery-time models on the 120-scenario
-  telemetry. `cumulative_delay` is the supervised target; features are
-  derived from the per-second occupancy / speed timeseries.
+`data/ml_training/master_traffic_features.csv` — one row per
+(scenario × seed), schema:
+
+| column | type | description |
+| --- | --- | --- |
+| `run_id` | int | seed index (1 for Mode A; 1–5 for Mode B) |
+| `road_id` | string | direction (regional_north / …) |
+| `time_slot` | string | 10am / 1pm / 5pm |
+| `incident_duration` | int | closure length in seconds (600 / 900 / 1200) |
+| `transition_type` | string | e.g. `2closed_to_1closed` |
+| `spatial_occupancy_ratio` | float | network `occupied_m / capacity_m` at T |
+| `hgv_ratio` | float | HGV ÷ (cars + HGV) on the network at T |
+| `backpressure_segment_count` | int | # of cells in the "red" (>80 %) band at T |
+| `escape_flow_rate` | float | veh/s exiting via escape edges at T |
+| `recovery_time_seconds` | float | **target** — observed OR final-120 s slope extrapolation, capped 3600 s. `null` only for closure-only rows. |
+
+Snapshot time T = base_horizon (the moment of reopening for recovery
+scenarios; the end of closure for static-closure rows).
+
+---
+
+## 8. Physics & ML Validation
+
+For the formal write-up of the audit items required by the dissertation —
+Greenshields per-network limits, the 20–30 % stochastic merge friction,
+the 50 % partial-closure bottleneck cap, the dynamic 5 %–40 % escape
+divergence curve, and the linear-extrapolation rule for censored recovery
+times — see **`malta-road-recovery/reports/validation_notes.md`**.
+
+Headline model performance on the 360 recovery-labelled rows:
+
+| Metric | Value |
+| --- | --- |
+| Test R² | **0.979** |
+| Test MAE | **127 seconds** |
+| Best hyper-parameters | `n_estimators=100, max_depth=None, min_samples_split=10` |
+
+Top feature importances:
+
+| feature | importance |
+| --- | --- |
+| `backpressure_segment_count` | 0.72 |
+| `spatial_occupancy_ratio` | 0.27 |
+| (all others) | < 0.01 |
+
+The size of the jam at the moment of reopening dominates the prediction
+— physically faithful.
+
+---
+
+## 9. Reproducibility
+
+Every numeric constant the engine relies on lives in
+`config/simulation.yaml`. Random seeds are explicit:
+
+- **Mode A** uses the fixed default `rng_seed = 42`.
+- **Mode B** seeds run `i ∈ {1..5}` deterministically as `1000 + i × 7919`.
+
+Re-running the same batch on the same machine produces identical
+`master_traffic_features.csv` files.
+
+---
+
+## 10. Citation and Licence
+
+If you use this work academically:
+
+> Abela, K. (2026). *Malta Road Recovery: a custom NetworkX digital-twin
+> simulator and Random Forest predictor for post-incident traffic
+> recovery on Maltese arterials.* University of Malta — FYP IAPT-ARI2201.
+
+License: see `LICENSE` (FYP work; institutional terms apply).

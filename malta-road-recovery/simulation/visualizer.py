@@ -439,9 +439,9 @@ def _draw_legend(ax: plt.Axes) -> None:
 
     # ── COLOUR SCALE ──
     y = section("OCCUPANCY", y)
-    for label, colour in [("< 40 %  free flow", COL_GREEN),
-                          ("40 – 80 %  congested", COL_ORANGE),
-                          ("> 80 %  jam", COL_RED)]:
+    for label, colour in [("Green   < 40 %   Free Flow",   COL_GREEN),
+                          ("Orange  40–80 %  Congested",   COL_ORANGE),
+                          ("Red     > 80 %   Jam",         COL_RED)]:
         ax.add_patch(plt.Rectangle((0.04, y - 0.018), 0.10, 0.022,
                                     facecolor=colour, edgecolor="none",
                                     transform=ax.transAxes))
@@ -453,8 +453,8 @@ def _draw_legend(ax: plt.Axes) -> None:
     y -= 0.02
     y = section("LANE STATE", y)
     style_specs = [
-        ("solid",        "-",      "Open / partial closure"),
-        ("dashed",       (0,(4,4)),"Full closure (all lanes)"),
+        ("solid",   "-",       "Solid  — Open or partial closure"),
+        ("dashed",  (0,(4,4)), "Dotted — Full closure (all lanes)"),
     ]
     for _, ls, label in style_specs:
         line = plt.Line2D([0.04, 0.14], [y - 0.005, y - 0.005],

@@ -50,6 +50,14 @@ DIRECTION_LABEL = {
     "valley_west":    "Valley Road Westbound  (VWB)",
 }
 
+# Short codes used by the ML inference banner.
+DIRECTION_SHORT = {
+    "regional_north": "RNB",
+    "regional_south": "RSB",
+    "valley_east":    "VEB",
+    "valley_west":    "VWB",
+}
+
 VARIANT_LABEL = {
     "all_open":        "All lanes open (baseline)",
     "1_lane_closed":   "1 lane closed",
@@ -76,9 +84,13 @@ MODE_LABEL = {
 # ---------------------------------------------------------------------------
 
 def _ask(prompt: str) -> str:
+    """Read a line of input safely. EOF (Ctrl-D) and KeyboardInterrupt
+    (Ctrl-C) both translate to 'q' so the caller can quit cleanly without
+    raising an exception that would crash the menu loop."""
     try:
         return input(prompt).strip()
-    except EOFError:
+    except (EOFError, KeyboardInterrupt):
+        print()   # newline so the prompt line is closed visibly
         return "q"
 
 
@@ -184,23 +196,44 @@ def _preview_single(fixed_mode: str, action_label: str) -> None:
 
 
 def _action_standard_batch() -> None:
-    print("\n  RUN STANDARD BATCH — 1× run, visual precomputations + 1 ML row set.")
-    confirm = _ask("  Proceed? This (re)builds all playback files. [y/N] ")
+    print()
+    print("=" * 57)
+    print("  [3] RUN STANDARD BATCH  —  Simulator Precomputation")
+    print("=" * 57)
+    print("  This will:")
+    print("    • Iterate the full 162-scenario matrix once (fixed seed).")
+    print("    • Write timestamp-by-timestamp playback files into")
+    print("      data/synthetic/scenarios/<H>s/ (≈ 5 minutes total).")
+    print("    • Purge data/ml_training/ then write 162 ML rows with run_id=1.")
+    print("  Visual file generation only — for the GUI playback in [1] and [2].")
+    confirm = _ask("\n  Proceed? [y/N] ")
     if not confirm.lower().startswith("y"):
         return
-    force = _ask("  Force re-simulation of cached scenarios? [y/N] ").lower().startswith("y")
+    force = _ask("  Force re-simulation of already-cached scenarios? [y/N] ").lower().startswith("y")
     from simulation.scenarios import run_standard_batch
     run_standard_batch(force=force, verbose=True)
     _ask("\nPress Enter to return to the main menu… ")
 
 
 def _action_ml_factory_batch() -> None:
-    print("\n  RUN ML FACTORY BATCH — 5× multi-seed runs.")
-    print("  • Purges data/ml_training/ first (stale csv/parquet removed).")
-    print("  • Runs the full matrix 5× with distinct seeds.")
-    print("  • Runs 1–4 are headless; only the 5th writes JSON playback files.")
-    print("  • Every run appends its T-snapshot with a run_id (1–5).")
-    confirm = _ask("\n  This is heavy (5 × full matrix). Proceed? [y/N] ")
+    print()
+    print("=" * 57)
+    print("  [4] RUN ML FACTORY BATCH  —  5x Multi-Seed Iterations")
+    print("=" * 57)
+    print("  This will:")
+    print("    • PURGE data/ml_training/ (older csv/parquet files removed).")
+    print("    • Run the full 162-scenario matrix 5 times with distinct seeds.")
+    print("      Each seed perturbs:")
+    print("        - the exact second each vehicle spawns,")
+    print("        - the Car vs. HGV spawn order,")
+    print("        - the 20–30 % merge-friction penalty at every junction.")
+    print("    • Runs 1–4 are HEADLESS (no JSON written — no file bloat).")
+    print("    • Only the 5th run writes the visual playback JSONs.")
+    print("    • Every run appends its T = base_horizon snapshot to")
+    print("      master_traffic_features.csv with run_id ∈ {1,2,3,4,5}.")
+    print("  Result: 810 ML training rows.")
+    print("  Expected duration: ≈ 5 minutes on a modern laptop.")
+    confirm = _ask("\n  Proceed? [y/N] ")
     if not confirm.lower().startswith("y"):
         return
     from simulation.scenarios import run_ml_factory_batch
@@ -272,19 +305,39 @@ def _action_predict() -> None:
         _ask("\nPress Enter to return… ")
         return
 
+    # ── Dissertation-grade banner readout ─────────────────────────────
     secs = out["predicted_seconds"]
+    feats = out["features"]
+    road_short = DIRECTION_SHORT.get(direction, direction.upper())
+    slot_short = {"10am": "10:00", "1pm": "13:00", "5pm": "17:00"}.get(slot, slot)
+    dur_min = base_h // 60
+    trans_short = {
+        "2closed_to_1closed":  "2->1 State",
+        "2closed_to_0closed":  "2->0 State",
+        "1closed_to_0closed":  "1->0 State",
+    }.get(transition, transition)
+    # Display occupancy as a percentage; clamp at 100 (raw ratio can exceed
+    # 1.0 when the closure traps more vehicles than the static capacity).
+    occ_pct = min(feats.get("spatial_occupancy_ratio", 0.0) * 100.0, 100.0)
+
     print()
-    print("  " + "-" * 52)
-    print(f"  [ML PREDICTION] Predicted Road Recovery Time: "
-          f"{secs:.0f} seconds ({secs/60:.1f} minutes)")
-    print("  " + "-" * 52)
+    print("=" * 57)
+    print("  [ML INFERENCE PREDICTION SUITE]")
+    print("=" * 57)
+    print(f"  * Query Parameters: {road_short} | {slot_short} | "
+          f"{dur_min}-min Horizon | {trans_short}")
+    print(f"  * Extracted Baseline Spatial Occupancy: {occ_pct:.1f}%")
+    print(f"  * Extracted Baseline HGV Ratio:         {feats['hgv_ratio']*100:.1f}%")
+    print(f"  * Extracted Backpressure Segments:      "
+          f"{int(feats['backpressure_segment_count'])} cells")
+    print(f"  * Extracted Escape Flow Rate:           "
+          f"{feats['escape_flow_rate']:.2f} veh/s")
+    print(f"  * Predicted Post-Incident Recovery Time: "
+          f"{secs:.0f} Seconds ({secs/60:.1f} Minutes)")
+    print("=" * 57)
     if out.get("baseline_source"):
-        print(f"  baseline conditions from: {out['baseline_source']}")
-    print(f"  inputs: occ_ratio={out['features']['spatial_occupancy_ratio']:.3f}  "
-          f"hgv={out['features']['hgv_ratio']:.3f}  "
-          f"backpressure={out['features']['backpressure_segment_count']}  "
-          f"escape={out['features']['escape_flow_rate']:.2f}")
-    _ask("\nPress Enter to return… ")
+        print(f"  baseline source: {out['baseline_source']}")
+    _ask("\nPress Enter to return to the main menu… ")
 
 
 # ---------------------------------------------------------------------------
@@ -310,22 +363,34 @@ def run_menu() -> None:
         print("=" * 57)
         choice = _ask("\n> ")
 
-        if choice == "1":
-            _preview_single(MODE_CLOSURE_ONLY,
-                            "Static Closure Preview")
-        elif choice == "2":
-            _preview_single(MODE_RECOVERY,
-                            "Closure & Opening Recovery Preview")
-        elif choice == "3":
-            _action_standard_batch()
-        elif choice == "4":
-            _action_ml_factory_batch()
-        elif choice == "5":
-            _action_train_ml()
-        elif choice == "6":
-            _action_predict()
-        elif choice in ("7", "q", "quit", "exit"):
-            print("\nBye.\n")
-            return
-        else:
-            print("Invalid choice. Try again.")
+        try:
+            if choice == "1":
+                _preview_single(MODE_CLOSURE_ONLY,
+                                "Static Closure Preview")
+            elif choice == "2":
+                _preview_single(MODE_RECOVERY,
+                                "Closure & Opening Recovery Preview")
+            elif choice == "3":
+                _action_standard_batch()
+            elif choice == "4":
+                _action_ml_factory_batch()
+            elif choice == "5":
+                _action_train_ml()
+            elif choice == "6":
+                _action_predict()
+            elif choice in ("7", "q", "quit", "exit"):
+                print("\nBye.\n")
+                return
+            else:
+                print("Invalid choice. Try again.")
+                continue
+        except KeyboardInterrupt:
+            print("\n  Interrupted — returning to the main menu.")
+        except Exception as exc:
+            # Don't crash the session for one bad action.
+            import traceback
+            print(f"\n  An error occurred while running this action: {exc}")
+            traceback.print_exc()
+            _ask("\nPress Enter to return to the main menu… ")
+        # Loop continues — Quit branch returns above; Invalid prints in the
+        # `else` branch inside the try block and falls through to here.
