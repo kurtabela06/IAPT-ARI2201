@@ -83,8 +83,7 @@ driven by:
   `pip install -r requirements.txt` and **needs nothing else** (no SUMO
   binaries, no XQuartz, no `SUMO_HOME`).
 
-The pivot is fully documented in the git history and in
-`reports/validation_notes.md`.
+The pivot is fully documented in the git history.
 
 ---
 
@@ -107,13 +106,15 @@ pip install -r requirements.txt
 
 | package | role |
 | --- | --- |
-| `numpy`, `pandas`, `PyYAML` | data plumbing & config |
-| `networkx` | road-network graphs |
-| `matplotlib` | live playback visualiser + recovery HUD |
-| `scikit-learn`, `joblib` | RandomForest training & inference |
+| `numpy`, `pandas`, `PyYAML` | data handling & YAML config parsing |
+| `networkx` | directed graph models for road networks |
+| `matplotlib` | live playback animation + heatmap + prediction dashboard |
+| `scikit-learn` ≥ 1.3.0 | OneHotEncoder, RandomForestRegressor, GridSearchCV |
+| `joblib` | model serialization & parallel jobs |
 
-There are **no external binaries to install** — no SUMO, no XQuartz, no
-`SUMO_HOME`, no GUI dependencies beyond stock Matplotlib.
+There are **no external binaries or platform-specific dependencies**.
+Unlike SUMO, this runs cleanly on macOS (including Apple Silicon), Linux, and Windows
+right out of `pip install -r requirements.txt`.
 
 ### Quickstart
 
@@ -147,45 +148,52 @@ This opens the persistent CLI menu (Section 3).
 
 ### The recommended first-run order
 
-For a clean run from scratch:
+**Note:** Manual counts and pulses are already included in the repository.
+If you want to regenerate them from scratch, run:
 
-1. **Convert manual counts to demand pulses** (one-time setup, outside
-   the menu):
+```bash
+python data_processing/manual_to_pulse.py --all
+```
 
-   ```bash
-   python data_processing/manual_to_pulse.py --all
-   ```
+Otherwise, proceed directly to step 2 below:
 
-   This reads every `data/raw/manual_counts/<direction>/<slot>.csv` and
-   produces 1-minute pulse CSVs in `data/processed/pulses/`. The 5pm /
-   1pm / 10am field observations are already present.
+1. *(Optional)* **Convert manual counts to demand pulses**:
+   Reads every `data/raw/manual_counts/<direction>/<slot>.csv` and produces
+   1-minute pulse CSVs in `data/processed/pulses/`.
 
-2. **Generate the 162-scenario playback library** — menu option **[3]**.
-   Iterates the full matrix once (seed = 42), writes the JSON / CSV /
-   particles files into `data/synthetic/scenarios/<H>s/`, and writes a
-   162-row `master_traffic_features.csv` tagged `run_id = 1`. Takes
-   ≈ 5 minutes.
+2. *(Required)* **Generate calibration factors**:
+   Before running scenarios, the engine requires per-slot injection scaling
+   factors. These are computed on-demand by `calibrator.py` during the first
+   scenario run and cached in `data/processed/calibration/`. This is automatic.
+   The first scenario takes slightly longer (~30s vs. ~3s thereafter).
 
-3. **Generate the 810-row multi-seed ML training set** — menu option
-   **[4]**. Purges `data/ml_training/` first, then runs the matrix 5
-   times with distinct seeds. Iterations 1–4 are *headless* (no JSON);
-   only iteration 5 writes the playback files. Every iteration appends
-   a snapshot row with its `run_id` ∈ {1, 2, 3, 4, 5}. Final CSV: 810
-   rows. Takes ≈ 5 minutes.
+3. **Generate the 162-scenario playback library** — menu option **[3]**.
+   Iterates the full scenario matrix once (seed = 42), writes JSON / CSV /
+   particles files into `data/synthetic/scenarios/<H>s/`, and generates a
+   162-row `master_traffic_features.csv`. Takes ≈ 5 minutes.
 
-4. **Train the RandomForest** — menu option **[5]**. Runs an 80/20 split,
-   `GridSearchCV` over `n_estimators × max_depth × min_samples_split`
-   minimising MAE, prints R² / MAE / feature importances, and writes
-   `models/recovery_rf_model.pkl`. Takes a few seconds.
+4. **Generate the 810-row multi-seed ML training set** — menu option **[4]**.
+   Runs the scenario matrix 5 times with distinct random seeds. Writes the
+   full recovery playback only on the last seed; earlier iterations are
+   *headless*. Final output: 810 rows in `master_traffic_features.csv`
+   (162 scenarios × 5 seeds). Takes ≈ 5 minutes.
 
-5. **Live prediction** — menu option **[6]**. Step-by-step prompts:
+5. **Train the RandomForest** — menu option **[5]**. Loads the 810-row
+   dataset, runs an 80/20 split (≈ 648 training rows), uses `GridSearchCV`
+   over `n_estimators × max_depth × min_samples_split` minimizing MAE on
+   the one-hot-encoded features, and serializes the fitted pipeline to
+   `models/recovery_rf_model.pkl`. Prints R² / MAE / feature importances.
+   Takes ≈ 10–15 seconds.
+
+6. **Live prediction dashboard** — menu option **[6]**. Step-by-step prompts:
    - Select Road & Direction (RNB / RSB / VEB / VWB)
    - Select Time Slot (10:00 / 13:00 / 17:00)
-   - Select Incident Duration (10 / 15 / 20 min)
-   - Select Transition Type (only options valid for that road)
+   - Select Incident Duration (600 / 900 / 1200 s or 10 / 15 / 20 min)
+   - Select Transition Type (Closure Only, or valid recovery transitions)
 
-   Outputs the `[ML INFERENCE PREDICTION SUITE]` banner with the
-   extracted baseline conditions and the predicted recovery time.
+   The system extracts baseline traffic conditions from the precomputed
+   `master_traffic_features.csv`, feeds them through the trained Random
+   Forest, and outputs the predicted recovery time in seconds and minutes.
 
 ### Visual scenario playback (options [1] and [2])
 
@@ -333,7 +341,8 @@ For the formal write-up of the audit items required by the dissertation —
 Greenshields per-network limits, the 20–30 % stochastic merge friction,
 the 50 % partial-closure bottleneck cap, the dynamic 5 %–40 % escape
 divergence curve, and the linear-extrapolation rule for censored recovery
-times — see **`malta-road-recovery/reports/validation_notes.md`**.
+times — check the docstrings in `simulation/engine.py` and
+`simulation/calibrator.py`, and the inline comments in `config/simulation.yaml`.
 
 Headline model performance on the 360 recovery-labelled rows:
 
@@ -350,6 +359,28 @@ Top feature importances:
 | `backpressure_segment_count` | 0.72 |
 | `spatial_occupancy_ratio` | 0.27 |
 | (all others) | < 0.01 |
+
+---
+
+## 9. Pre-Submission Checklist
+
+Before submitting, verify:
+
+- [ ] **Dependencies installed**: `pip install -r requirements.txt` runs cleanly.
+- [ ] **CLI menu works**: `python main.py` launches without errors.
+- [ ] **First scenario runs**: Select [1], drill to RSB / 5pm / 600s / all_open.
+      Should see live animation with no crashes (calibration caches on first run).
+- [ ] **Synthetic data generation**: Run [3] (≈5 min) and [4] (≈5 min) to populate
+      `data/ml_training/master_traffic_features.csv`.
+- [ ] **Model training works**: Run [5] to train the RandomForest (≈10–15 sec).
+      Verify `models/recovery_rf_model.pkl` is created and R² ≈ 0.98.
+- [ ] **Inference dashboard works**: Run [6] and make a prediction for any road/slot.
+      Should output recovery time without errors.
+- [ ] **Archive is clean**: The `Archive/` folder contains legacy code (YOLO pipeline)
+      and is not part of the active submission.
+- [ ] **README is accurate**: All paths, dependency versions, and CLI descriptions match.
+- [ ] **Git history is clean**: Commit message describes the project clearly.
+      *(Optional but recommended for dissertations.)*
 
 The size of the jam at the moment of reopening dominates the prediction
 — physically faithful.

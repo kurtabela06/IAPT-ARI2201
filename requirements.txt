@@ -1,20 +1,24 @@
 # Malta Road Recovery — Python dependencies
 # Install with: pip install -r requirements.txt
-# Tested on Python 3.10+ (3.11 recommended)
+# Tested on Python 3.10, 3.11, 3.12
 
 numpy>=1.26.0
 pandas>=2.2.0
 PyYAML>=6.0.1               # config file parsing
 
-# Phase 2 — custom NetworkX engine + Matplotlib visualisation
-networkx>=3.2
-matplotlib>=3.8.0
+# Simulation engine & visualisation
+networkx>=3.2              # road network graphs
+matplotlib>=3.8.0          # heatmap + animation + dashboard
 
-# Optional / archive CV pipeline (legacy tools, not required for the active pipeline)
-# ultralytics>=8.2.0
+# Machine learning
+scikit-learn>=1.3.0        # RandomForestRegressor + GridSearchCV + OneHotEncoder
+joblib>=1.3.0              # pipeline serialization
+
+# Development / testing (optional)
+# pytest>=8.0.0
+
+# Legacy / archived (not required for active pipeline)
+# ultralytics>=8.2.0       # YOLO detection (Phase 1, obsolete)
 # opencv-python-headless>=4.9.0
 # scipy>=1.12.0
 # lapx>=0.5.5
-
-# Optional / tests
-pytest>=8.0.0
