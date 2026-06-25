@@ -1,124 +1,57 @@
 IAPT-ARI2201/
-│
-├── Archive/                            # Scrapped YOLO/CV pipeline — reference only
+|
+├── .vscode/
+├── Archive/                            # Legacy YOLO / CV utilities (reference)
 │   ├── vision/
-│   │   ├── detect.py                   # (legacy) YOLOv8 + ByteTrack single-clip driver
-│   │   ├── virtual_gates.py            # (legacy) VirtualGate / GateCrossing / make_gate
-│   │   ├── utils.py                    # (legacy) ROI + geometry helpers
-│   │   ├── config.py                   # (legacy) CV calibration constants
-│   │   └── video_config.py             # (legacy) per-clip YAML sidecar loader
-│   ├── data/
-│   │   ├── processed/yolo_output/      # (legacy) historical YOLO output location
-│   │   └── video_sidecars/             # (legacy) per-clip calibration YAMLs
+│   │   ├── detect.py
+│   │   ├── virtual_gates.py
+│   │   ├── utils.py
+│   │   ├── config.py
+│   │   └── video_config.py
 │   └── tests/
-│       └── test_gates.py               # (legacy) Phase 1 CV unit tests
-│
+│       └── test_gates.py
+|
 ├── README.md
 ├── file_structure.txt
 ├── requirements.txt
-│
+├── .gitignore
+|
 └── malta-road-recovery/
-    │
-    ├── main.py                         # *** ACTIVE PHASE 1 DRIVER ***
-    │                                   # Walks every manual count CSV and writes
-    │                                   # aggregated bins, SUMO demand, and metrics.
-    │
-    ├── phase2.py                       # Phase 2 driver
-    ├── run.py                          # Run script
-    │
+    |
+    ├── main.py                         # primary CLI / driver
+    
     ├── config/
-    │   └── simulation.yaml             # SUMO run parameters, time steps
-    │
+    │   └── simulation.yaml
+    
     ├── data/
     │   ├── raw/
-    │   │   ├── manual_counts/          # *** PHASE 1 INPUT ***
-    │   │   │   ├── README.md           # row-level schema + naming convention
-    │   │   │   ├── regional_north/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
-    │   │   │   ├── regional_south/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
-    │   │   │   ├── valley_east/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
-    │   │   │   └── valley_west/
-    │   │   │       ├── 10am.csv
-    │   │   │       ├── 1pm.csv
-    │   │   │       └── 5pm.csv
-    │   │   ├── video/                  # raw 10-minute .mp4 clips (for human observer)
-    │   │   └── osm/                    # downloaded .osm files
+    │   │   ├── manual_counts/
+    │   │   │   ├── regional_north/ (10am, 1pm, 5pm)
+    │   │   │   ├── regional_south/ (10am, 1pm, 5pm)
+    │   │   │   ├── valley_east/    (10am, 1pm, 5pm)
+    │   │   │   └── valley_west/    (10am, 1pm, 5pm)
+    │   │   ├── video/                # clip placeholders (.gitkeep)
+    │   │   └── osm/
     │   │       └── regional_road.osm
     │   ├── processed/
-    │   │   ├── pulses/                 # output of manual_to_pulse.py (per direction):
+    │   │   ├── pulses/               # outputs from manual_to_pulse.py
     │   │   │   ├── regional_north/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
     │   │   │   ├── regional_south/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
     │   │   │   ├── valley_east/
-    │   │   │   │   ├── 10am.csv
-    │   │   │   │   ├── 1pm.csv
-    │   │   │   │   └── 5pm.csv
     │   │   │   └── valley_west/
-    │   │   │       ├── 10am.csv
-    │   │   │       ├── 1pm.csv
-    │   │   │       └── 5pm.csv
-    │   │   └── calibration/            # calibration injection files
-    │   │       ├── regional_north_10am_injection.json
-    │   │       ├── regional_north_1pm_injection.json
-    │   │       ├── regional_north_5pm_injection.json
-    │   │       ├── regional_south_10am_injection.json
-    │   │       ├── regional_south_1pm_injection.json
-    │   │       ├── regional_south_5pm_injection.json
-    │   │       ├── valley_east_10am_injection.json
-    │   │       ├── valley_east_1pm_injection.json
-    │   │       ├── valley_east_5pm_injection.json
-    │   │       ├── valley_west_10am_injection.json
-    │   │       ├── valley_west_1pm_injection.json
-    │   │       └── valley_west_5pm_injection.json
+    │   │   └── calibration/          # injection JSONs
     │   ├── synthetic/
-    │   │   └── simulation_runs/        # TraCI run outputs (Phase 2/3)
-    │   │       ├── 600s/
-    │   │       │   ├── regional_north/
-    │   │       │   ├── regional_south/
-    │   │       │   ├── valley_east/
-    │   │       │   └── valley_west/
-    │   │       ├── 900s/
-    │   │       │   ├── regional_north/
-    │   │       │   ├── regional_south/
-    │   │       │   ├── valley_east/
-    │   │       │   └── valley_west/
-    │   │       ├── 1200s/
-    │   │       │   ├── regional_north/
-    │   │       │   ├── regional_south/
-    │   │       │   ├── valley_east/
-    │   │       │   └── valley_west/
-    │   │       ├── 1800s/
-    │   │       │   ├── regional_north/
-    │   │       │   ├── regional_south/
-    │   │       │   ├── valley_east/
-    │   │       │   └── valley_west/
-    │   │       └── 2400s/
-    │   │           ├── regional_north/
-    │   │           ├── regional_south/
-    │   │           ├── valley_east/
-    │   │           └── valley_west/
-    │   └── features/
-    │       ├── train.csv               # ML feature matrix (Phase 4)
-    │       └── test.csv
-    │
-    ├── data_processing/                # Phase 1 — manual-entry pipeline
+    │   │   └── scenarios/            # many per-duration scenario CSV/JSONs
+    │   │       ├── 600s/  900s/ 1200s/
+    │   │       \/ 1800s/ 2400s/
+    │   └── ml_training/
+    │       └── master_traffic_features.csv
+    
+    ├── data_processing/
     │   ├── __init__.py
-    │   └── manual_to_pulse.py          # Manual CSV → aggregated bins
-    │
-    ├── simulation/                     # Phase 2 + 3 — SUMO & TraCI
+    │   └── manual_to_pulse.py
+    
+    ├── simulation/
     │   ├── __init__.py
     │   ├── calibrator.py
     │   ├── cli.py
@@ -126,21 +59,28 @@ IAPT-ARI2201/
     │   ├── networks.py
     │   ├── run_sumo.py
     │   ├── scenarios.py
-    │   └── visualizer.py
-    │
-    ├── ml/                             # Phase 4 — modelling
-    │   ├── build_features.py           # raw sim CSVs → features/train.csv
-    │   ├── train.py                    # XGBoost + RF + linear baseline
-    │   ├── evaluate.py                 # RMSE, feature importance plots
-    │   └── models/
-    │       ├── predict.py
-    │       ├── xgboost_trec.pkl
-    │       └── rf_trec.pkl
-    │
+    │   ├── visualizer.py
+    │   └── build_features.py
+    
+    ├── ml/
+    │   ├── __init__.py
+    │   ├── train_model.py              # RandomForest training + figures
+    │   └── predict.py                  # inference helper
+    
+    ├── models/
+    │   └── recovery_rf_model.pkl
+    
     ├── reports/
-    │   ├── validation_notes.md         # manual observations per direction
-    │   └── figures/                    # exported plots for writeup
-    │
+    │   ├── report_draft.md
+    │   ├── validation_notes.md
+    │   └── figures/
+    │       ├── feature_importance.png
+    │       ├── predicted_vs_actual.png
+    │       ├── RNB.png
+    │       ├── RSB.png
+    │       ├── VEB.png
+    │       └── VWB.png
+    
     └── tests/
-        ├── test_traci_loop.py          # Phase 2/3 — TraCI loop tests
-        └── test_features.py            # Phase 4 — feature engineering tests
+        ├── test_traci_loop.py
+        └── test_features.py

@@ -52,6 +52,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -198,6 +199,58 @@ def train(csv_path: Path = DATA_CSV, *, verbose: bool = True) -> dict:
             bar = "█" * int(imp * 50)
             print(f"    {name:<34} {imp:6.3f} {bar}")
         print("=" * 56)
+
+    # Dataset-level statistics for reporting.
+    total_rows = len(df)
+    natural_recovery = int((df[TARGET] < 3600).sum())
+    system_failures = int((df[TARGET] == 3600).sum())
+
+    fig_dir = PROJECT_ROOT / "reports" / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print("\n  DATASET PROFILE STATISTICS FOR REPORT:")
+        print("  " + "-" * 52)
+        print(f"    Total Data Rows Generated (5 Seeds) : {total_rows}")
+        print(f"    Successfully Recovered Scenarios     : {natural_recovery}")
+        print(f"    Catastrophic System Failures (3600s) : {system_failures}")
+        print(f"    Training Set Size (80%)             : {len(X_train)}")
+        print(f"    Testing Set Size (20%)              : {len(X_test)}")
+        print("  " + "-" * 52)
+
+        print(f"\n  Saving model quality figures to: {fig_dir}")
+
+    # Feature importance figure.
+    plt.figure(figsize=(10, 6))
+    names = [kv[0] for kv in importances]
+    scores = [kv[1] for kv in importances]
+    plt.barh(names[::-1], scores[::-1], color="#3498db", edgecolor="none")
+    plt.xlabel("Mean Decrease in Impurity (MDI)")
+    plt.title("Random Forest Feature Importance Rankings")
+    plt.tight_layout()
+    plt.savefig(fig_dir / "feature_importance.png", dpi=300)
+    plt.close()
+
+    # Predicted vs actual scatter plot.
+    y_pred = best.predict(X_test)
+    plt.figure(figsize=(7, 7))
+    plt.scatter(y_test, y_pred, alpha=0.6, color="#2ecc71",
+                edgecolors="none", label="Test Data Snapshot")
+    max_val = max(float(y_test.max()), float(y_pred.max()))
+    plt.plot([0, max_val], [0, max_val], color="#e74c3c",
+             linestyle="--", label="Perfect Accuracy Line (y=x)")
+    plt.xlabel("Actual Recovery Time (Seconds)")
+    plt.ylabel("Predicted Recovery Time (Seconds)")
+    plt.title(f"Predicted vs. Actual Recovery Duration (R² = {r2:.3f})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fig_dir / "predicted_vs_actual.png", dpi=300)
+    plt.close()
+
+    if verbose:
+        print(f"  ✓ Saved Feature Importance plot to: {fig_dir / 'feature_importance.png'}")
+        print(f"  ✓ Saved Predicted vs Actual plot to: {fig_dir / 'predicted_vs_actual.png'}")
+        print("=" * 56 + "\n")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump({
