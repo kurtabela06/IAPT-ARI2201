@@ -4,7 +4,7 @@
 recovery-time predictor for the Triq Regionali and Valley Road corridors
 in Malta.**
 
-*FYP submission, course IAPT-ARI2201. Kurt Abela, University of Malta.*
+*IAPT submission, course IAPT-ARI2201. Kurt Abela, University of Malta.*
 
 ---
 
